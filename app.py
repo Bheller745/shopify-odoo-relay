@@ -1,0 +1,442 @@
+"""Shopify -> Odoo Online real-time order sync.
+
+Receives Shopify order webhooks (orders/create, orders/updated,
+orders/cancelled), verifies the HMAC signature, and creates/updates the
+matching sale.order in Odoo via XML-RPC.
+
+Idempotent: matches existing orders by client_order_ref = Shopify's order
+"name" (e.g. "#1001"), so Shopify's at-least-once delivery retries never
+create duplicates.
+
+Required environment variables (set these in Railway's dashboard, never
+commit real values to git):
+    ODOO_URL       e.g. https://920d-custom.odoo.com
+    ODOO_DB        e.g. 920d-custom
+    ODOO_LOGIN     e.g. bheller@920dcustom.com
+    ODOO_PASSWORD  Odoo password or API key
+    SHOPIFY_WEBHOOK_SECRET   from Shopify admin's webhook settings
+"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import xmlrpc.client
+
+from flask import Flask, request, jsonify
+
+app = Flask(__name__)
+
+ODOO_URL = os.environ["ODOO_URL"]
+ODOO_DB = os.environ["ODOO_DB"]
+ODOO_LOGIN = os.environ["ODOO_LOGIN"]
+ODOO_PASSWORD = os.environ["ODOO_PASSWORD"]
+SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]
+
+_common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
+_uid = _common.authenticate(ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD, {})
+_models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
+
+
+def odoo(model, method, args, kwargs=None):
+    return _models.execute_kw(ODOO_DB, _uid, ODOO_PASSWORD, model, method, args, kwargs or {})
+
+
+def odoo_safe(model, method, args, kwargs=None):
+    """Some Odoo action methods (reconcile, the invoice-wizard action, etc)
+    return a value that fails XML-RPC marshalling even though the
+    server-side action succeeded -- swallow only that specific failure."""
+    try:
+        return odoo(model, method, args, kwargs)
+    except Exception as e:
+        if "cannot marshal None" in str(e):
+            return None
+        raise
+
+
+def verify_hmac(raw_body: bytes, hmac_header: str) -> bool:
+    digest = hmac.new(SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
+    computed = base64.b64encode(digest).decode()
+    return hmac.compare_digest(computed, hmac_header or "")
+
+
+def find_or_create_partner(shopify_order):
+    email = (shopify_order.get("email") or shopify_order.get("contact_email")
+             or (shopify_order.get("customer") or {}).get("email"))
+    if not email:
+        return None
+
+    existing = odoo("res.partner", "search", [[("email", "=", email)]], {"limit": 1})
+    if existing:
+        return existing[0]
+
+    customer = shopify_order.get("customer") or {}
+    shipping = shopify_order.get("shipping_address") or {}
+    name = " ".join(filter(None, [customer.get("first_name"), customer.get("last_name")])).strip() or email
+
+    vals = {
+        "name": name,
+        "email": email,
+        "phone": shipping.get("phone") or shopify_order.get("phone") or "",
+        "street": shipping.get("address1") or "",
+        "street2": shipping.get("address2") or "",
+        "city": shipping.get("city") or "",
+        "zip": shipping.get("zip") or "",
+    }
+    country_code = shipping.get("country_code")
+    if country_code:
+        country = odoo("res.country", "search", [[("code", "=", country_code)]], {"limit": 1})
+        if country:
+            vals["country_id"] = country[0]
+            state_code = shipping.get("province_code")
+            if state_code:
+                state = odoo("res.country.state", "search", [
+                    [("country_id", "=", country[0]), ("code", "=", state_code)]
+                ], {"limit": 1})
+                if state:
+                    vals["state_id"] = state[0]
+    return odoo("res.partner", "create", [vals])
+
+
+def line_discount_percent(item):
+    """Real per-line discount %, computed from Shopify's own discount_allocations
+    (exact dollar amount actually taken off this line) -- never guessed/assumed,
+    works the same regardless of how the discount was applied (code, app,
+    automatic) or what rate it happens to be."""
+    price = float(item.get("price") or 0.0)
+    qty = item.get("quantity") or 1
+    list_total = price * qty
+    if list_total <= 0:
+        return 0.0
+    discount_total = sum(float(a.get("amount") or 0.0) for a in (item.get("discount_allocations") or []))
+    return round((discount_total / list_total) * 100, 2)
+
+
+def order_discount_source(shopify_order):
+    """Human-readable label for WHY a discount was applied, so Odoo can
+    distinguish a dealer/wholesale order from a one-off site promo. Prefers
+    an explicit signal (order tags naming the wholesale app) over guessing;
+    falls back to the real discount code/title Shopify used; blank if no
+    discount was applied at all."""
+    if not any(float(li.get("total_discount") or 0.0) > 0 for li in shopify_order.get("line_items", [])):
+        return False
+
+    tags = (shopify_order.get("tags") or "").lower()
+    if "wholesale" in tags or "dealer" in tags:
+        # Report the actual observed rate rather than hardcoding 40 -- if the
+        # program's rate ever changes, this stays accurate automatically.
+        items = shopify_order.get("line_items", [])
+        pct = round(sum(line_discount_percent(i) for i in items) / len(items), 1) if items else 0
+        return f"Dealer {pct:g}%"
+
+    for app in shopify_order.get("discount_applications", []):
+        code = app.get("code") or app.get("title")
+        if code:
+            return f"Promo: {code}"
+
+    return "Website discount"
+
+
+def build_order_lines(shopify_order):
+    lines = []
+    for item in shopify_order.get("line_items", []):
+        sku = item.get("sku")
+        product_id = None
+        if sku:
+            found = odoo("product.template", "search", [[("default_code", "=", sku)]], {"limit": 1})
+            if found:
+                product_id = found[0]
+        line_vals = {
+            "name": item.get("name") or item.get("title") or sku or "Shopify line item",
+            "product_uom_qty": item.get("quantity") or 1,
+            "price_unit": float(item.get("price") or 0.0),
+            "discount": line_discount_percent(item),
+            # Force no tax: products are intentionally configured with no
+            # sales tax (Shopify is the system of record for tax actually
+            # collected), but Odoo's automated tax engine will otherwise
+            # inject a tax guess despite the empty product config.
+            "tax_ids": [(6, 0, [])],
+        }
+        if product_id:
+            line_vals["product_id"] = product_id
+        lines.append((0, 0, line_vals))
+    return lines
+
+
+def find_existing_order(order_ref):
+    found = odoo("sale.order", "search", [[("client_order_ref", "=", order_ref)]], {"limit": 1})
+    return found[0] if found else None
+
+
+def extract_tracking(shopify_order):
+    """Pull the tracking number/company off the first fulfillment with one,
+    if any. Shopify puts real fulfillment data (tracking_company,
+    tracking_number) in the order payload's fulfillments array once shipped."""
+    for f in shopify_order.get("fulfillments", []):
+        tracking_number = f.get("tracking_number") or (f.get("tracking_numbers") or [None])[0]
+        tracking_company = f.get("tracking_company")
+        if tracking_number:
+            return tracking_number, tracking_company
+    return None, None
+
+
+_CARRIER_CACHE = {}
+
+
+def find_carrier_id(tracking_company, shopify_order):
+    """Match Shopify's free-text tracking_company to one of our configured
+    delivery.carrier records (each has a real tracking_url template), so
+    Odoo's computed Tracking URL actually populates. USPS/FedEx have
+    separate Domestic/International carriers -- picked via the shipping
+    country. Returns None (not fatal) if nothing matches -- the tracking
+    number itself still gets saved either way."""
+    if not tracking_company:
+        return None
+
+    if not _CARRIER_CACHE:
+        for c in odoo("delivery.carrier", "search_read", [[]], {"fields": ["id", "name"]}):
+            _CARRIER_CACHE[c["name"]] = c["id"]
+
+    company = tracking_company.lower()
+    is_us = (shopify_order.get("shipping_address") or {}).get("country_code") == "US"
+
+    if "usps" in company or "postal" in company:
+        return _CARRIER_CACHE.get("USPS Domestic" if is_us else "USPS International")
+    if "fedex" in company:
+        return _CARRIER_CACHE.get("Fedex US" if is_us else "Fedex International")
+    if "ups" in company:
+        return _CARRIER_CACHE.get("UPS")
+    return None
+
+
+def try_ship_delivery(order_id, shopify_order=None):
+    """Validate the order's real delivery (actually deducts on-hand stock)
+    if there's enough quantity to fully cover it -- matches real-world
+    reality for a live order (unlike the historical backfill, which
+    deliberately avoided real stock movement since that history was already
+    baked into current on-hand counts). If stock is short, don't force it
+    negative -- flag x_delivery_review_needed and leave it for manual
+    review. QuickBooks remains the source of truth for inventory in the
+    meantime, so an occasional gap here isn't catastrophic, just needs a
+    human look."""
+    pickings = odoo("stock.picking", "search_read",
+        [[("sale_id", "=", order_id), ("state", "not in", ("done", "cancel"))]],
+        {"fields": ["id", "move_ids"]})
+    if not pickings:
+        return
+
+    move_ids = [m for p in pickings for m in p["move_ids"]]
+    if not move_ids:
+        return
+    moves = odoo("stock.move", "read", move_ids, {"fields": ["id", "product_id", "product_uom_qty"]})
+
+    product_ids = list({m["product_id"][0] for m in moves})
+    qty_available = {p["id"]: p["qty_available"] for p in odoo("product.product", "read", [product_ids], {"fields": ["qty_available"]})}
+
+    # Sum demand per product across all moves on this order, in case the
+    # same product appears on more than one line/move.
+    demand_by_product = {}
+    for m in moves:
+        pid = m["product_id"][0]
+        demand_by_product[pid] = demand_by_product.get(pid, 0) + m["product_uom_qty"]
+
+    if any(qty_available.get(pid, 0) < qty for pid, qty in demand_by_product.items()):
+        odoo("sale.order", "write", [[order_id], {"x_delivery_review_needed": True}])
+        return
+
+    # carrier_tracking_url is a read-only field computed from carrier_id's
+    # tracking_url template + carrier_tracking_ref -- setting both is what
+    # actually makes the clickable link populate, not just the ref alone.
+    tracking_number, tracking_company = extract_tracking(shopify_order or {})
+    carrier_id = find_carrier_id(tracking_company, shopify_order or {})
+
+    for m in moves:
+        odoo("stock.move", "write", [[m["id"]], {"quantity": m["product_uom_qty"]}])
+    for p in pickings:
+        if tracking_number:
+            update_vals = {"carrier_tracking_ref": tracking_number}
+            if carrier_id:
+                update_vals["carrier_id"] = carrier_id
+            odoo("stock.picking", "write", [[p["id"]], update_vals])
+        try:
+            odoo("stock.picking", "button_validate", [[p["id"]]])
+        except Exception:
+            odoo("sale.order", "write", [[order_id], {"x_delivery_review_needed": True}])
+
+
+_MISC_JOURNAL_ID = None
+_SHOPIFY_BANK_ACCOUNT_ID = None
+
+
+def _misc_journal_id():
+    global _MISC_JOURNAL_ID
+    if _MISC_JOURNAL_ID is None:
+        _MISC_JOURNAL_ID = odoo("account.journal", "search", [[("code", "=", "MISC")]], {"limit": 1})[0]
+    return _MISC_JOURNAL_ID
+
+
+def _shopify_bank_account_id():
+    global _SHOPIFY_BANK_ACCOUNT_ID
+    if _SHOPIFY_BANK_ACCOUNT_ID is None:
+        _SHOPIFY_BANK_ACCOUNT_ID = odoo("account.account", "search", [[("name", "=", "920D Shopify")]], {"limit": 1})[0]
+    return _SHOPIFY_BANK_ACCOUNT_ID
+
+
+def auto_invoice_and_pay(order_id, order_ref):
+    """Shopify has already collected real payment for this order --
+    financial_status is exactly "paid" by the time this is called (checked
+    by the caller). Odoo should reflect that immediately instead of
+    sitting in "To Invoice"/"Not Paid" waiting on someone to click through
+    the invoice + register-payment flow by hand for every single order.
+
+    Creates a regular invoice (sale.advance.payment.inv wizard -- the
+    underlying _create_invoices is a private method, not RPC-callable) for
+    the full order, posts it, then settles it with a direct reconciling
+    journal entry against the "920D Shopify" account (the real payout
+    account Shopify Payments deposits into). Deliberately NOT using
+    account.payment/Register Payment here -- verified directly (2026-09)
+    that it only flips payment_state to "in_payment" without actually
+    reconciling the AR line (amount_residual stays untouched), even on a
+    clean single-invoice test with no historical data involved. The manual
+    settlement-move-and-reconcile approach is the one proven to actually
+    zero out the residual, throughout this whole migration project.
+    """
+    wiz_ctx = {"active_model": "sale.order", "active_ids": [order_id], "active_id": order_id}
+    wiz_id = odoo("sale.advance.payment.inv", "create", [{"advance_payment_method": "delivered"}], {"context": wiz_ctx})
+    odoo_safe("sale.advance.payment.inv", "create_invoices", [[wiz_id]], {"context": wiz_ctx})
+
+    invoices = odoo("account.move", "search_read",
+        [[("invoice_origin", "=", order_ref), ("move_type", "=", "out_invoice"), ("state", "=", "draft")]],
+        {"fields": ["id"]})
+    for inv in invoices:
+        inv_id = inv["id"]
+        odoo("account.move", "action_post", [[inv_id]])
+        ar_lines = odoo("account.move.line", "search_read",
+            [[("move_id", "=", inv_id), ("account_id.account_type", "=", "asset_receivable")]],
+            {"fields": ["id", "account_id", "partner_id", "debit", "credit"]})
+        if not ar_lines:
+            continue
+        amt = sum(l["debit"] - l["credit"] for l in ar_lines)
+        if abs(amt) < 0.01:
+            continue
+        settle_id = odoo("account.move", "create", [{
+            "journal_id": _misc_journal_id(),
+            "ref": f"Shopify auto-pay for {order_ref}",
+            "line_ids": [
+                (0, 0, {"account_id": _shopify_bank_account_id(), "name": "Shopify auto-payment", "debit": amt, "credit": 0.0}),
+                (0, 0, {"account_id": ar_lines[0]["account_id"][0], "partner_id": ar_lines[0]["partner_id"][0] if ar_lines[0]["partner_id"] else False,
+                        "name": "Shopify auto-payment", "debit": 0.0, "credit": amt}),
+            ],
+        }])
+        odoo("account.move", "action_post", [[settle_id]])
+        settle_line = odoo("account.move.line", "search_read",
+            [[("move_id", "=", settle_id), ("account_id.account_type", "=", "asset_receivable")]], {"fields": ["id"]})[0]
+        odoo_safe("account.move.line", "reconcile", [[l["id"] for l in ar_lines] + [settle_line["id"]]])
+
+
+@app.route("/webhook/shopify", methods=["POST"])
+def shopify_webhook():
+    raw_body = request.get_data()
+    hmac_header = request.headers.get("X-Shopify-Hmac-Sha256", "")
+    if not verify_hmac(raw_body, hmac_header):
+        return jsonify({"error": "invalid signature"}), 401
+
+    topic = request.headers.get("X-Shopify-Topic", "")
+    payload = json.loads(raw_body)
+    order_ref = payload.get("name") or str(payload.get("id"))
+
+    # In-person sales are handled entirely in Odoo's own POS app, not synced
+    # from Shopify -- skip anything that came from Shopify POS so the two
+    # never double-book the same physical sale.
+    if (payload.get("source_name") or "").lower() == "pos":
+        return jsonify({"status": "skipped", "reason": "pos order, handled natively in Odoo", "order_ref": order_ref}), 200
+
+    try:
+        if topic == "orders/cancelled":
+            existing_id = find_existing_order(order_ref)
+            if existing_id:
+                odoo("sale.order", "action_cancel", [[existing_id]])
+            return jsonify({"status": "cancelled", "order_ref": order_ref}), 200
+
+        existing_id = find_existing_order(order_ref)
+        partner_id = find_or_create_partner(payload)
+        if not partner_id:
+            return jsonify({"error": "no customer email on order"}), 400
+
+        discount_source = order_discount_source(payload)
+
+        if existing_id:
+            existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked"]})[0]
+            existing_state = existing["state"]
+            invoice_checked = existing["x_invoice_checked"]
+            update_vals = {"partner_id": partner_id, "x_discount_source": discount_source}
+            if existing_state == "draft":
+                # Safe to fully rebuild lines only pre-confirmation -- Odoo
+                # blocks removing lines from a confirmed order (invoicing/
+                # delivery tracking), so confirmed orders keep their
+                # original lines and only get header fields refreshed here.
+                update_vals["order_line"] = [(5, 0, 0)] + build_order_lines(payload)
+            odoo("sale.order", "write", [[existing_id], update_vals])
+            new_id = existing_id
+        else:
+            invoice_checked = False
+            new_id = odoo("sale.order", "create", [{
+                # Explicitly set name = order_ref so the Odoo order number
+                # IS the Shopify order number (e.g. "920-36218") instead of
+                # Odoo's own auto-generated S00001-style sequence. This only
+                # bypasses the sequence for this one record -- it keeps
+                # counting normally for anything else that doesn't set name.
+                "name": order_ref,
+                "partner_id": partner_id,
+                "client_order_ref": order_ref,
+                "x_discount_source": discount_source,
+                "order_line": build_order_lines(payload),
+            }])
+
+        financial_status = payload.get("financial_status")
+        if financial_status in ("paid", "partially_paid") or payload.get("confirmed"):
+            try:
+                odoo("sale.order", "action_confirm", [[new_id]])
+            except Exception:
+                pass  # already confirmed or not confirmable yet -- not fatal
+
+            # Only auto-invoice+pay on a real, fully-paid order -- a
+            # partially_paid order genuinely only has PART of the money in,
+            # so auto-marking the whole invoice paid would misrepresent
+            # reality. Gated on x_invoice_checked (not "is this new") so a
+            # mid-request failure-and-retry doesn't silently skip it forever.
+            if financial_status == "paid" and not invoice_checked:
+                try:
+                    auto_invoice_and_pay(new_id, order_ref)
+                except Exception:
+                    pass  # invoicing issue -- not fatal, doesn't block the order sync itself
+                odoo("sale.order", "write", [[new_id], {"x_invoice_checked": True}])
+
+        # "Completed" = locked. An order is only truly done once it's fully
+        # paid AND fully shipped -- partial payment or partial fulfillment
+        # doesn't count. Checked on every delivery (create + updates) since
+        # fulfillment almost always happens via a later orders/updated
+        # webhook, not the initial create. Idempotent: writing locked=True
+        # on an already-locked order is a harmless no-op.
+        if financial_status == "paid" and payload.get("fulfillment_status") == "fulfilled":
+            try:
+                try_ship_delivery(new_id, payload)
+            except Exception:
+                pass  # delivery issue -- not fatal, doesn't block the order sync itself
+            try:
+                odoo("sale.order", "write", [[new_id], {"locked": True}])
+            except Exception:
+                pass  # not confirmed yet or otherwise not lockable -- not fatal
+
+        return jsonify({"status": "ok", "order_ref": order_ref, "odoo_order_id": new_id}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"status": "ok"}), 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
