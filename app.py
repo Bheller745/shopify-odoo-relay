@@ -264,6 +264,80 @@ def try_ship_delivery(order_id, shopify_order=None):
             odoo("sale.order", "write", [[order_id], {"x_delivery_review_needed": True}])
 
 
+BACKORDER_MO_CAP = 10
+
+
+def split_into_batches(qty, cap=BACKORDER_MO_CAP):
+    """15 -> [10, 5]; 25 -> [10, 10, 5]."""
+    batches = []
+    remaining = qty
+    while remaining > 0:
+        batch = min(cap, remaining)
+        batches.append(batch)
+        remaining -= batch
+    return batches
+
+
+def create_backorder_mos(order_id, order_ref):
+    """Create MOs to cover any on-hand shortfall for order_id's lines.
+    Safe to call more than once: dedups on (origin, product_id) rather than
+    sale_line_id, because draft-order edits fully delete+recreate
+    sale.order.line rows (see the (5,0,0) rebuild above), which would make
+    a sale_line_id-keyed dedup check silently miss."""
+    order_lines = odoo("sale.order.line", "search_read",
+        [[("order_id", "=", order_id), ("product_id", "!=", False)]],
+        {"fields": ["id", "product_id", "product_uom_qty"]})
+    if not order_lines:
+        return
+
+    product_ids = list({l["product_id"][0] for l in order_lines})
+    products = {p["id"]: p for p in odoo("product.template", "read",
+        [product_ids], {"fields": ["is_storable", "qty_available", "uom_id"]})}
+
+    origin = f"Shopify backorder: {order_ref}"
+
+    for line in order_lines:
+        product_id = line["product_id"][0]
+        product = products.get(product_id)
+        if not product or not product["is_storable"]:
+            continue  # service products excluded -- can't manufacture those
+
+        shortfall = (line["product_uom_qty"] or 0) - (product["qty_available"] or 0)
+        if shortfall <= 0:
+            continue
+
+        already = odoo("mrp.production", "search",
+            [[("origin", "=", origin), ("product_id", "=", product_id)]], {"limit": 1})
+        if already:
+            continue
+
+        for batch_qty in split_into_batches(shortfall):
+            # Left in "draft" deliberately -- Bennett wants "Confirmed" (=
+            # Awaiting Build) to mean the work order has actually been
+            # printed and handed to the floor. Draft MOs can still be
+            # printed fine; a person clicks Odoo's native "Confirm" button
+            # once they've done that, which is what moves it into the
+            # Awaiting Build queue the scanning app looks for.
+            odoo("mrp.production", "create", [{
+                "product_id": product_id,
+                "product_qty": batch_qty,
+                # Odoo Online (saas~19.4) uses "uom_id" here -- a documented
+                # field-name drift from other Odoo versions that use
+                # "product_uom_id" for the same concept.
+                "uom_id": product["uom_id"][0],
+                "origin": origin,
+                "sale_line_id": line["id"],
+                # Native "Sale" smart button on the MO reads sale_line_id
+                # directly and already works. x_sale_order_id is a custom
+                # field that drives the reverse direction (a "Manufacturing
+                # Orders" section on the Sale Order form) since Odoo's own
+                # mrp_production_count/ids there are computed through the
+                # procurement/stock-move chain, which this catalog doesn't
+                # use yet (no BOM routing configured).
+                "x_sale_order_id": order_id,
+            }])
+
+
 _MISC_JOURNAL_ID = None
 _SHOPIFY_BANK_ACCOUNT_ID = None
 
@@ -366,9 +440,10 @@ def shopify_webhook():
         discount_source = order_discount_source(payload)
 
         if existing_id:
-            existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked"]})[0]
+            existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked", "x_backorder_checked"]})[0]
             existing_state = existing["state"]
             invoice_checked = existing["x_invoice_checked"]
+            backorder_checked = existing["x_backorder_checked"]
             update_vals = {"partner_id": partner_id, "x_discount_source": discount_source}
             if existing_state == "draft":
                 # Safe to fully rebuild lines only pre-confirmation -- Odoo
@@ -380,6 +455,7 @@ def shopify_webhook():
             new_id = existing_id
         else:
             invoice_checked = False
+            backorder_checked = False
             new_id = odoo("sale.order", "create", [{
                 # Explicitly set name = order_ref so the Odoo order number
                 # IS the Shopify order number (e.g. "920-36218") instead of
@@ -399,6 +475,14 @@ def shopify_webhook():
                 odoo("sale.order", "action_confirm", [[new_id]])
             except Exception:
                 pass  # already confirmed or not confirmable yet -- not fatal
+
+            # Only start production once payment is real -- avoids committing
+            # shop floor capacity to orders that might not go through. Gated
+            # on x_backorder_checked (not "is this a new order") so a
+            # mid-request failure-and-retry doesn't silently skip it forever.
+            if not backorder_checked:
+                create_backorder_mos(new_id, order_ref)
+                odoo("sale.order", "write", [[new_id], {"x_backorder_checked": True}])
 
             # Only auto-invoice+pay on a real, fully-paid order -- a
             # partially_paid order genuinely only has PART of the money in,
