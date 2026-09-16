@@ -279,7 +279,9 @@ def split_into_batches(qty, cap=BACKORDER_MO_CAP):
 
 
 def create_backorder_mos(order_id, order_ref):
-    """Create MOs to cover any on-hand shortfall for order_id's lines.
+    """Create an MO for the full ordered quantity of every storable line on
+    order_id -- deliberately ignores on-hand stock entirely (Bennett wants
+    a build order for what was sold, every time, not just the shortfall).
     Safe to call more than once: dedups on (origin, product_id) rather than
     sale_line_id, because draft-order edits fully delete+recreate
     sale.order.line rows (see the (5,0,0) rebuild above), which would make
@@ -292,7 +294,7 @@ def create_backorder_mos(order_id, order_ref):
 
     product_ids = list({l["product_id"][0] for l in order_lines})
     products = {p["id"]: p for p in odoo("product.template", "read",
-        [product_ids], {"fields": ["is_storable", "qty_available", "uom_id"]})}
+        [product_ids], {"fields": ["is_storable", "uom_id"]})}
 
     origin = f"Shopify backorder: {order_ref}"
 
@@ -302,8 +304,8 @@ def create_backorder_mos(order_id, order_ref):
         if not product or not product["is_storable"]:
             continue  # service products excluded -- can't manufacture those
 
-        shortfall = (line["product_uom_qty"] or 0) - (product["qty_available"] or 0)
-        if shortfall <= 0:
+        qty_ordered = line["product_uom_qty"] or 0
+        if qty_ordered <= 0:
             continue
 
         already = odoo("mrp.production", "search",
@@ -311,7 +313,7 @@ def create_backorder_mos(order_id, order_ref):
         if already:
             continue
 
-        for batch_qty in split_into_batches(shortfall):
+        for batch_qty in split_into_batches(qty_ordered):
             # Left in "draft" deliberately -- Bennett wants "Confirmed" (=
             # Awaiting Build) to mean the work order has actually been
             # printed and handed to the floor. Draft MOs can still be
