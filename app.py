@@ -448,6 +448,94 @@ def auto_invoice_and_pay(order_id, order_ref):
         odoo_safe("account.move.line", "reconcile", [[l["id"] for l in ar_lines] + [settle_line["id"]]])
 
 
+def total_refunded(shopify_order):
+    """Sum of all successful refund transactions Shopify has recorded
+    against this order so far. Shopify's order payload carries a growing
+    "refunds" array (one entry per refund event, each with its own
+    transactions) -- this is always the cumulative total, not just the
+    latest refund, which is why the caller diffs it against
+    x_refunded_amount rather than treating it as a delta directly."""
+    total = 0.0
+    for refund in shopify_order.get("refunds", []):
+        for txn in refund.get("transactions", []):
+            if txn.get("kind") == "refund" and txn.get("status") == "success":
+                total += float(txn.get("amount") or 0.0)
+    return total
+
+
+def process_refund(order_id, order_ref, refund_amount):
+    """Mirror image of auto_invoice_and_pay: issues a credit note for the
+    refunded amount against the original invoice, then settles it with a
+    reversing journal entry showing the cash actually leaving the "920D
+    Shopify" payout account back to the customer. Only meaningful once the
+    order's already been through auto_invoice_and_pay (there must be a
+    posted invoice to credit against) -- a no-op otherwise."""
+    orig_invoice = odoo("account.move", "search_read",
+        [[("invoice_origin", "=", order_ref), ("move_type", "=", "out_invoice"), ("state", "=", "posted")]],
+        {"fields": ["id", "partner_id"], "limit": 1})
+    if not orig_invoice:
+        return
+    inv = orig_invoice[0]
+
+    credit_note_id = odoo("account.move", "create", [{
+        "move_type": "out_refund",
+        "partner_id": inv["partner_id"][0],
+        "invoice_origin": order_ref,
+        "ref": f"Shopify refund for {order_ref}",
+        "invoice_line_ids": [(0, 0, {
+            "name": f"Shopify refund for {order_ref}",
+            "quantity": 1,
+            "price_unit": refund_amount,
+            "tax_ids": [(6, 0, [])],
+        })],
+    }])
+    odoo("account.move", "action_post", [[credit_note_id]])
+
+    cn_ar = odoo("account.move.line", "search_read",
+        [[("move_id", "=", credit_note_id), ("account_id.account_type", "=", "asset_receivable")]],
+        {"fields": ["id", "account_id"]})
+    if not cn_ar:
+        return
+
+    settle_id = odoo("account.move", "create", [{
+        "journal_id": _misc_journal_id(),
+        "ref": f"Shopify refund settlement for {order_ref}",
+        "line_ids": [
+            (0, 0, {"account_id": cn_ar[0]["account_id"][0], "partner_id": inv["partner_id"][0],
+                    "name": "Shopify refund", "debit": refund_amount, "credit": 0.0}),
+            (0, 0, {"account_id": _shopify_bank_account_id(), "name": "Shopify refund", "debit": 0.0, "credit": refund_amount}),
+        ],
+    }])
+    odoo("account.move", "action_post", [[settle_id]])
+    settle_ar = odoo("account.move.line", "search_read",
+        [[("move_id", "=", settle_id), ("account_id.account_type", "=", "asset_receivable")]], {"fields": ["id"]})[0]
+    odoo_safe("account.move.line", "reconcile", [[l["id"] for l in cn_ar] + [settle_ar["id"]]])
+
+
+def cancel_or_flag_mos(order_ref):
+    """Shopify order cancellations have no equivalent for a build that's
+    already in progress or finished -- so this splits on MO state instead
+    of blindly cancelling: anything not yet built is safe to cancel
+    outright (the floor should stop), anything already "done" gets a
+    chatter flag instead since the physical item (and the builder's pay
+    for it) already exists and needs a human decision, not a silent
+    deletion."""
+    origin = f"Shopify backorder: {order_ref}"
+    mos = odoo("mrp.production", "search_read", [[("origin", "=", origin)]], {"fields": ["id", "state", "name"]})
+    for mo in mos:
+        if mo["state"] == "done":
+            odoo_safe("mrp.production", "message_post", [[mo["id"]]], {
+                "body": f"Shopify order {order_ref} was cancelled AFTER this build was already marked Done -- review whether it needs to be reworked or returned to stock."
+            })
+        elif mo["state"] != "cancel":
+            try:
+                odoo("mrp.production", "write", [[mo["id"]], {"state": "cancel"}])
+            except Exception:
+                odoo_safe("mrp.production", "message_post", [[mo["id"]]], {
+                    "body": f"Shopify order {order_ref} was cancelled but this MO could not be auto-cancelled -- needs manual review."
+                })
+
+
 @app.route("/webhook/shopify", methods=["POST"])
 def shopify_webhook():
     raw_body = request.get_data()
@@ -469,7 +557,30 @@ def shopify_webhook():
         if topic == "orders/cancelled":
             existing_id = find_existing_order(order_ref)
             if existing_id:
-                odoo("sale.order", "action_cancel", [[existing_id]])
+                existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["x_invoice_checked", "amount_total"]})[0]
+                cancel_or_flag_mos(order_ref)
+                if existing["x_invoice_checked"] and existing["amount_total"]:
+                    # Odoo blocks cancelling an order that's already been
+                    # invoiced -- a full reversing credit note is the real
+                    # equivalent (same mechanism as a partial refund, just
+                    # for the whole amount) instead of letting this throw.
+                    try:
+                        process_refund(existing_id, order_ref, existing["amount_total"])
+                        odoo("sale.order", "write", [[existing_id], {"x_refunded_amount": existing["amount_total"]}])
+                        odoo_safe("sale.order", "message_post", [[existing_id]], {
+                            "body": "Shopify cancelled this order after it was already invoiced -- issued a full reversing credit note instead of blocking the cancel."
+                        })
+                    except Exception as e:
+                        odoo_safe("sale.order", "message_post", [[existing_id]], {
+                            "body": f"Shopify cancelled this order but the reversing credit note failed ({str(e)[:300]}) -- needs manual review."
+                        })
+                else:
+                    try:
+                        odoo("sale.order", "action_cancel", [[existing_id]])
+                    except Exception as e:
+                        odoo_safe("sale.order", "message_post", [[existing_id]], {
+                            "body": f"Shopify cancelled this order but Odoo could not auto-cancel it ({str(e)[:300]}) -- needs manual review."
+                        })
             return jsonify({"status": "cancelled", "order_ref": order_ref}), 200
 
         existing_id = find_existing_order(order_ref)
@@ -481,10 +592,11 @@ def shopify_webhook():
         new_products = []
 
         if existing_id:
-            existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked", "x_backorder_checked"]})[0]
+            existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked", "x_backorder_checked", "x_refunded_amount"]})[0]
             existing_state = existing["state"]
             invoice_checked = existing["x_invoice_checked"]
             backorder_checked = existing["x_backorder_checked"]
+            already_refunded = existing["x_refunded_amount"] or 0.0
             update_vals = {"partner_id": partner_id, "x_discount_source": discount_source}
             if existing_state == "draft":
                 # Safe to fully rebuild lines only pre-confirmation -- Odoo
@@ -497,6 +609,7 @@ def shopify_webhook():
         else:
             invoice_checked = False
             backorder_checked = False
+            already_refunded = 0.0
             new_id = odoo("sale.order", "create", [{
                 # Explicitly set name = order_ref so the Odoo order number
                 # IS the Shopify order number (e.g. "920-36218") instead of
@@ -537,6 +650,27 @@ def shopify_webhook():
                 except Exception:
                     pass  # invoicing issue -- not fatal, doesn't block the order sync itself
                 odoo("sale.order", "write", [[new_id], {"x_invoice_checked": True}])
+
+        # Refunds (full or partial) land as orders/updated webhooks with a
+        # growing "refunds" array and financial_status flipped to
+        # "refunded"/"partially_refunded" -- handled independently of the
+        # block above since a refund can arrive well after the order was
+        # paid+invoiced, with financial_status no longer even "paid" by
+        # then. Only meaningful once there's a real invoice to credit
+        # against (invoice_checked), and diffed against what's already
+        # been processed so Shopify's at-least-once retries never double
+        # the reversal.
+        if invoice_checked:
+            refunded_now = total_refunded(payload)
+            delta = refunded_now - already_refunded
+            if delta > 0.01:
+                try:
+                    process_refund(new_id, order_ref, delta)
+                    odoo("sale.order", "write", [[new_id], {"x_refunded_amount": refunded_now}])
+                except Exception as e:
+                    odoo_safe("sale.order", "message_post", [[new_id]], {
+                        "body": f"Shopify refund of ${delta:.2f} could not be auto-reconciled ({str(e)[:300]}) -- needs manual review."
+                    })
 
         # "Completed" = locked. An order is only truly done once it's fully
         # paid AND fully shipped -- partial payment or partial fulfillment
