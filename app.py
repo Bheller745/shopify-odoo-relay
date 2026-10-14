@@ -536,6 +536,59 @@ def cancel_or_flag_mos(order_ref):
                 })
 
 
+def find_order_by_shopify_id(shopify_order_id):
+    if not shopify_order_id:
+        return None
+    found = odoo("sale.order", "search", [[("x_shopify_order_id", "=", str(shopify_order_id))]], {"limit": 1})
+    return found[0] if found else None
+
+
+def describe_return_items(payload):
+    items = []
+    for li in payload.get("return_line_items", []):
+        qty = li.get("quantity")
+        reason = li.get("return_reason") or ""
+        items.append(f"{qty}x (reason: {reason})" if reason else f"{qty}x")
+    return ", ".join(items) if items else "(no line item detail)"
+
+
+def handle_return_webhook(topic, payload):
+    """Returns only get visibility (chatter note + a flag) here, never an
+    automatic stock/refund action -- a returned item needs physical
+    inspection before it's safe to say it's resellable, and the actual
+    money movement still arrives separately through the normal refund
+    path (total_refunded/process_refund above) once Shopify issues it.
+    Silently no-ops if the order predates x_shopify_order_id being
+    tracked (set at order creation, see shopify_webhook below) -- nothing
+    to attach the note to in that case."""
+    order_id = find_order_by_shopify_id(payload.get("order_id"))
+    if not order_id:
+        return
+
+    items_desc = describe_return_items(payload)
+    return_name = payload.get("name") or payload.get("id")
+
+    if topic == "returns/request":
+        odoo("sale.order", "write", [[order_id], {"x_has_open_return": True}])
+        body = f"Shopify return {return_name} requested: {items_desc}. Awaiting approval."
+    elif topic == "returns/approve":
+        body = f"Shopify return {return_name} approved: {items_desc}. Awaiting item(s) back."
+    elif topic == "returns/decline":
+        odoo("sale.order", "write", [[order_id], {"x_has_open_return": False}])
+        body = f"Shopify return {return_name} declined: {items_desc}."
+    elif topic == "returns/cancel":
+        odoo("sale.order", "write", [[order_id], {"x_has_open_return": False}])
+        body = f"Shopify return {return_name} was cancelled."
+    elif topic == "returns/close":
+        odoo("sale.order", "write", [[order_id], {"x_has_open_return": False}])
+        body = (f"Shopify return {return_name} closed: {items_desc}. "
+                f"Any refund is handled separately via the normal refund sync.")
+    else:
+        return
+
+    odoo_safe("sale.order", "message_post", [[order_id]], {"body": body})
+
+
 @app.route("/webhook/shopify", methods=["POST"])
 def shopify_webhook():
     raw_body = request.get_data()
@@ -545,6 +598,18 @@ def shopify_webhook():
 
     topic = request.headers.get("X-Shopify-Topic", "")
     payload = json.loads(raw_body)
+
+    # Returns are a separate Shopify resource, not an Order payload -- their
+    # JSON only carries the numeric order_id (never the order name/number),
+    # so this is handled entirely separately from the order-sync logic
+    # below, matched via x_shopify_order_id instead of client_order_ref.
+    if topic.startswith("returns/"):
+        try:
+            handle_return_webhook(topic, payload)
+            return jsonify({"status": "ok", "topic": topic}), 200
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
     order_ref = payload.get("name") or str(payload.get("id"))
 
     # In-person sales are handled entirely in Odoo's own POS app, not synced
@@ -620,6 +685,11 @@ def shopify_webhook():
                 "partner_id": partner_id,
                 "client_order_ref": order_ref,
                 "x_discount_source": discount_source,
+                # Stored so a later Return webhook (a separate Shopify
+                # resource that only carries the numeric order_id, never
+                # the human-readable order name/number) can find this
+                # order directly -- no callback to Shopify's API needed.
+                "x_shopify_order_id": str(payload.get("id") or ""),
                 "order_line": build_order_lines(payload, new_products),
             }])
         warn_new_products(new_id, new_products)
