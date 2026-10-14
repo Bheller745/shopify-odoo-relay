@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -877,7 +878,12 @@ def audit_sync(days):
     return rows
 
 
-def render_dashboard(rows, days):
+def render_table_section(rows, days):
+    """Just the summary + table -- shared by the standalone /dashboard page
+    and the embedded /app page (which fetches this fragment client-side
+    and injects it, since the embedded shell itself has to load before
+    App Bridge can even produce a session token to authenticate the data
+    request with)."""
     clean = sum(1 for r in rows if not r["issues"])
     flagged = len(rows) - clean
     body_rows = []
@@ -889,7 +895,15 @@ def render_dashboard(rows, days):
             f"<td>{r['name']}</td><td>{r['financial_status']}</td><td>{r['fulfillment_status']}</td>"
             f"<td>${r['total']}</td><td>{issues_html}</td></tr>"
         )
-    html = f"""<!doctype html><html><head><meta charset="utf-8">
+    return f"""<div class="summary">Checked last {days} days &mdash; {len(rows)} orders, <b>{flagged} flagged</b>, {clean} clean.</div>
+<form method="get">Days back: <input type="number" name="days" value="{days}" style="width:70px"> <button type="submit">Refresh</button></form>
+<table><tr><th>Order</th><th>Shopify Payment</th><th>Shopify Fulfillment</th><th>Total</th><th>Issues</th></tr>
+{''.join(body_rows)}
+</table>"""
+
+
+def render_dashboard(rows, days):
+    return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>920D Shopify/Odoo Sync Status</title>
 <style>
 body {{ font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #222; }}
@@ -901,13 +915,8 @@ h1 {{ font-size: 20px; }}
 form {{ margin-bottom: 16px; }}
 </style></head><body>
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
-<div class="summary">Checked last {days} days &mdash; {len(rows)} orders, <b>{flagged} flagged</b>, {clean} clean.</div>
-<form method="get">Days back: <input type="number" name="days" value="{days}" style="width:70px"> <button type="submit">Refresh</button></form>
-<table><tr><th>Order</th><th>Shopify Payment</th><th>Shopify Fulfillment</th><th>Total</th><th>Issues</th></tr>
-{''.join(body_rows)}
-</table>
+{render_table_section(rows, days)}
 </body></html>"""
-    return html
 
 
 def check_dashboard_auth():
@@ -929,6 +938,108 @@ def dashboard():
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
     return Response(render_dashboard(rows, days), mimetype="text/html")
+
+
+def _b64url_decode(s):
+    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+
+def verify_shopify_id_token(token):
+    """Manual HS256 JWT verification (no PyJWT dependency, consistent with
+    the rest of this project's minimal-dependency style) of the App
+    Bridge session token Shopify signs with our own Client Secret.
+    Mirrors Shopify's documented embedded-app verification: signature,
+    audience, expiry/not-before, and iss/dest hostname match (proves the
+    token was actually issued for a page embedded in OUR shop's admin,
+    not replayed from somewhere else)."""
+    try:
+        header_b64, payload_b64, sig_b64 = token.split(".")
+    except ValueError:
+        return None
+    signing_input = f"{header_b64}.{payload_b64}".encode()
+    expected_sig = hmac.new(SHOPIFY_CLIENT_SECRET.encode(), signing_input, hashlib.sha256).digest()
+    try:
+        actual_sig = _b64url_decode(sig_b64)
+        payload = json.loads(_b64url_decode(payload_b64))
+    except Exception:
+        return None
+    if not hmac.compare_digest(expected_sig, actual_sig):
+        return None
+    now = time.time()
+    if payload.get("aud") != SHOPIFY_CLIENT_ID:
+        return None
+    if payload.get("exp", 0) < now or payload.get("nbf", now) > now:
+        return None
+    iss_host = urllib.parse.urlparse(payload.get("iss") or "").hostname
+    dest_host = urllib.parse.urlparse(payload.get("dest") or "").hostname
+    if not iss_host or iss_host != dest_host:
+        return None
+    return payload
+
+
+@app.route("/app", methods=["GET"])
+def embedded_app():
+    """The page Shopify Admin iframes in when you click the app in your
+    sidebar. Can't do the usual server-side auth check here -- App Bridge
+    itself has to load first before it can mint a session token -- so
+    this just serves a thin shell that calls shopify.idToken() client-side
+    and fetches the real content from /app/data once it has one."""
+    if not SHOPIFY_CLIENT_ID:
+        return jsonify({"error": "SHOPIFY_CLIENT_ID not configured on this server"}), 500
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="shopify-api-key" content="{SHOPIFY_CLIENT_ID}">
+<title>920D Sync Status</title>
+<script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+<style>
+body {{ font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #222; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
+td, th {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; vertical-align: top; }}
+th {{ background: #333; color: #fff; }}
+h1 {{ font-size: 20px; }}
+.summary {{ margin-bottom: 16px; }}
+form {{ margin-bottom: 16px; }}
+</style></head><body>
+<h1>920D Shopify &harr; Odoo Sync Status</h1>
+<div id="content">Loading...</div>
+<script>
+async function load(days) {{
+  document.getElementById('content').innerHTML = 'Loading...';
+  const token = await shopify.idToken();
+  const resp = await fetch('/app/data?days=' + (days || 60), {{ headers: {{ 'Authorization': 'Bearer ' + token }} }});
+  document.getElementById('content').innerHTML = await resp.text();
+  const form = document.querySelector('#content form');
+  if (form) {{
+    form.addEventListener('submit', function(e) {{
+      e.preventDefault();
+      load(form.querySelector('input[name=days]').value);
+    }});
+  }}
+}}
+load();
+</script>
+</body></html>"""
+    resp = Response(html, mimetype="text/html")
+    resp.headers["Content-Security-Policy"] = (
+        f"frame-ancestors https://{SHOPIFY_STORE_DOMAIN} https://admin.shopify.com;"
+    )
+    return resp
+
+
+@app.route("/app/data", methods=["GET"])
+def app_data():
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    payload = verify_shopify_id_token(token) if token else None
+    if not payload:
+        return Response("Invalid session token", 401, {"X-Shopify-Retry-Invalid-Session-Request": "1"})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    days = min(int(request.args.get("days", 60)), 365)
+    try:
+        rows = audit_sync(days)
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+    return Response(render_table_section(rows, days), mimetype="text/html")
 
 
 @app.route("/healthz", methods=["GET"])
