@@ -933,6 +933,9 @@ DASHBOARD_CSS = """
    reliably regardless of the row's own internal styling. */
 .order-cell { border-left: 4px solid #ccc; padding-left: 8px; }
 .nowrap { white-space: nowrap; }
+/* s-page defaults to a constrained, form-like reading width -- this is a
+   data table, not a form, so it should use the full available width. */
+s-page { max-width: none !important; width: 100% !important; }
 """
 
 FINANCIAL_BADGE = {
@@ -1016,12 +1019,12 @@ def render_table_section(rows, days):
             f'</s-table-row>'
         )
     return f"""<s-stack gap="base">
-<s-stack direction="inline" gap="base">
-<s-section heading="Orders checked"><s-paragraph><span data-stat="checked">{len(rows)}</span></s-paragraph></s-section>
-<s-section heading="Flagged"><s-paragraph><span data-stat="flagged">{flagged}</span></s-paragraph></s-section>
-<s-section heading="Clean"><s-paragraph><span data-stat="clean">{clean}</span></s-paragraph></s-section>
-<s-section heading="Dismissed"><s-paragraph><span data-stat="dismissed">{dismissed_count}</span></s-paragraph></s-section>
-</s-stack>
+<div style="display:flex; gap:12px; width:100%;">
+<s-section heading="Orders checked" style="flex:1"><s-paragraph><span data-stat="checked">{len(rows)}</span></s-paragraph></s-section>
+<s-section heading="Flagged" style="flex:1"><s-paragraph><span data-stat="flagged">{flagged}</span></s-paragraph></s-section>
+<s-section heading="Clean" style="flex:1"><s-paragraph><span data-stat="clean">{clean}</span></s-paragraph></s-section>
+<s-section heading="Dismissed" style="flex:1"><s-paragraph><span data-stat="dismissed">{dismissed_count}</span></s-paragraph></s-section>
+</div>
 <div class="filter-toolbar">
   <span class="muted">Days back</span>
   <input type="number" id="f-days" value="{days}" style="width:70px">
