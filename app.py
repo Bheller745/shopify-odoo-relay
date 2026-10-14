@@ -849,6 +849,7 @@ def audit_sync(days):
     odoo_orders = odoo("sale.order", "search_read", [[("name", "in", names)]], {"fields": [
         "id", "name", "state", "locked",
         "x_refunded_amount", "x_delivery_review_needed", "x_has_open_return",
+        "x_dashboard_dismissed_hash",
     ]}) if names else []
     odoo_by_name = {o["name"]: o for o in odoo_orders}
     odoo_ids = [o["id"] for o in odoo_orders]
@@ -892,6 +893,15 @@ def audit_sync(days):
         customer_name = " ".join(filter(None, [customer.get("first_name"), customer.get("last_name")])).strip()
         email = so.get("email") or customer.get("email") or ""
 
+        # Dismissing hashes the current issue set and stores it on the
+        # order -- so a dismissed row stays quiet only as long as its
+        # issues don't actually change. If something NEW goes wrong (or an
+        # old issue clears and a different one appears), the hash no
+        # longer matches and it re-flags automatically rather than
+        # staying silenced forever.
+        issue_hash = hashlib.sha256("||".join(sorted(issues)).encode()).hexdigest()[:16] if issues else None
+        dismissed = bool(issues) and bool(oo) and oo.get("x_dashboard_dismissed_hash") == issue_hash
+
         rows.append({
             "name": name,
             "shopify_id": so.get("id"),
@@ -904,6 +914,8 @@ def audit_sync(days):
             "created_at": (so.get("created_at") or "")[:10],
             "in_odoo": bool(oo),
             "issues": issues,
+            "issue_hash": issue_hash,
+            "dismissed": dismissed,
             "unmatched_skus": unmatched_skus,
         })
     return rows
@@ -939,6 +951,10 @@ tr:hover { background: #f1f6ff !important; }
 .badge-gray { background: #eceef0; color: #5c5f62; }
 .badge-blue { background: #e0edff; color: #1b4db3; }
 .muted { color: #8c9196; font-size: 12px; }
+.dismiss-btn, .restore-btn { padding: 4px 10px; border-radius: 6px; border: 1px solid #c9cccf; background: #fff; cursor: pointer; font-size: 12px; }
+.dismiss-btn:hover { background: #fde3e0; border-color: #d72c0d; }
+.restore-btn:hover { background: #e0edff; border-color: #1b4db3; }
+.dismiss-btn:disabled, .restore-btn:disabled { opacity: .5; cursor: default; }
 """
 
 FINANCIAL_BADGE = {
@@ -963,10 +979,12 @@ def render_table_section(rows, days):
     a small script living in each OUTER page template, not here --
     <script> tags inside HTML set via innerHTML never execute, so the
     filter logic has to live outside this fragment."""
-    clean = sum(1 for r in rows if not r["issues"])
-    flagged = len(rows) - clean
+    effectively_flagged = [r for r in rows if r["issues"] and not r["dismissed"]]
+    flagged = len(effectively_flagged)
+    dismissed_count = sum(1 for r in rows if r["dismissed"])
+    clean = len(rows) - flagged - dismissed_count
     body_rows = []
-    for r in sorted(rows, key=lambda r: (not r["issues"], r["name"])):
+    for r in sorted(rows, key=lambda r: (not (r["issues"] and not r["dismissed"]), r["name"])):
         display_issues = []
         for issue in r["issues"]:
             if issue.startswith("Unmatched SKU line(s): ") and r["unmatched_skus"]:
@@ -978,14 +996,23 @@ def render_table_section(rows, days):
             else:
                 display_issues.append(issue)
         issues_html = "<br>".join(display_issues) if display_issues else "OK"
-        issues_class = "issues" if r["issues"] else "issues ok"
+        if r["dismissed"]:
+            issues_html += ' <span class="badge badge-gray">Dismissed</span>'
+        is_flagged = bool(r["issues"]) and not r["dismissed"]
+        issues_class = "issues" if is_flagged else "issues ok"
         links = [f'<a href="{shopify_order_url(r["shopify_id"])}" target="_top">Shopify</a>']
         if r["odoo_id"]:
             links.append(f'<a href="{odoo_order_url(r["odoo_id"])}" target="_top">Odoo</a>')
+        action_html = "-"
+        if r["issues"]:
+            if r["dismissed"]:
+                action_html = f'<button class="restore-btn" data-order="{r["name"]}">Restore</button>'
+            else:
+                action_html = f'<button class="dismiss-btn" data-order="{r["name"]}" data-hash="{r["issue_hash"]}">Dismiss</button>'
         search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
         body_rows.append(
-            f'<tr class="{"row-flagged" if r["issues"] else ""}" '
-            f'data-flagged="{1 if r["issues"] else 0}" '
+            f'<tr class="{"row-flagged" if is_flagged else ""}" '
+            f'data-flagged="{1 if is_flagged else 0}" '
             f'data-financial="{r["financial_status"] or ""}" '
             f'data-fulfillment="{r["fulfillment_status"] or "unfulfilled"}" '
             f'data-search="{search_blob}">'
@@ -995,12 +1022,14 @@ def render_table_section(rows, days):
             f'<td>{badge(r["fulfillment_status"], FULFILLMENT_BADGE)}</td>'
             f'<td>${r["total"]}</td>'
             f'<td class="links">{"".join(links)}</td>'
-            f'<td class="{issues_class}">{issues_html}</td></tr>'
+            f'<td class="{issues_class}">{issues_html}</td>'
+            f'<td>{action_html}</td></tr>'
         )
     return f"""<div class="cards">
 <div class="card"><span class="num">{len(rows)}</span><span class="label">Orders checked</span></div>
 <div class="card flagged"><span class="num">{flagged}</span><span class="label">Flagged</span></div>
 <div class="card clean"><span class="num">{clean}</span><span class="label">Clean</span></div>
+<div class="card"><span class="num">{dismissed_count}</span><span class="label">Dismissed</span></div>
 </div>
 <div class="toolbar">
   <form method="get" style="display:flex;gap:8px;align-items:center;margin:0;">
@@ -1013,7 +1042,7 @@ def render_table_section(rows, days):
   <select id="f-financial"><option value="">Any payment status</option><option value="paid">Paid</option><option value="partially_paid">Partially paid</option><option value="pending">Pending</option><option value="refunded">Refunded</option><option value="partially_refunded">Partially refunded</option><option value="voided">Voided</option></select>
   <select id="f-fulfillment"><option value="">Any fulfillment</option><option value="fulfilled">Fulfilled</option><option value="partial">Partial</option><option value="unfulfilled">Unfulfilled</option></select>
 </div>
-<table id="sync-table"><thead><tr><th>Order</th><th>Customer</th><th>Payment</th><th>Fulfillment</th><th>Total</th><th>Links</th><th>Issues</th></tr></thead>
+<table id="sync-table"><thead><tr><th>Order</th><th>Customer</th><th>Payment</th><th>Fulfillment</th><th>Total</th><th>Links</th><th>Issues</th><th>Action</th></tr></thead>
 <tbody>
 {''.join(body_rows)}
 </tbody></table>"""
@@ -1039,6 +1068,24 @@ function wireFilters() {
   }
   [search, flag, financial, fulfillment].forEach(function(el) { el.addEventListener('input', apply); });
 }
+
+async function dismissAction(btn, getAuthHeaders, reload) {
+  btn.disabled = true;
+  const isDismiss = btn.classList.contains('dismiss-btn');
+  const headers = Object.assign({'Content-Type': 'application/json'}, await getAuthHeaders());
+  await fetch('/dismiss', {
+    method: 'POST',
+    headers: headers,
+    body: JSON.stringify({order: btn.dataset.order, hash: isDismiss ? btn.dataset.hash : ''}),
+  });
+  reload();
+}
+
+function wireActions(getAuthHeaders, reload) {
+  document.querySelectorAll('.dismiss-btn, .restore-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { dismissAction(btn, getAuthHeaders, reload); });
+  });
+}
 """
 
 
@@ -1049,8 +1096,10 @@ def render_dashboard(rows, days):
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
 {render_table_section(rows, days)}
 <script>{FILTER_JS}
-document.addEventListener('DOMContentLoaded', wireFilters);
+async function getAuthHeaders() {{ return {{}}; }}
+function reload() {{ location.reload(); }}
 wireFilters();
+wireActions(getAuthHeaders, reload);
 </script>
 </body></html>"""
 
@@ -1060,6 +1109,34 @@ def check_dashboard_auth():
     if not DASHBOARD_PASSWORD or not auth or not hmac.compare_digest(auth.password, DASHBOARD_PASSWORD):
         return False
     return True
+
+
+def check_any_dashboard_auth():
+    """Accepts either the standalone /dashboard's Basic Auth or the
+    embedded /app's App Bridge session token -- the dismiss action is
+    reachable from both pages, so it has to recognize whichever one the
+    request actually came from."""
+    if check_dashboard_auth():
+        return True
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+    return bool(token and verify_shopify_id_token(token))
+
+
+@app.route("/dismiss", methods=["POST"])
+def dismiss_issue():
+    if not check_any_dashboard_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    order_name = data.get("order")
+    issue_hash = data.get("hash") or False
+    if not order_name:
+        return jsonify({"error": "missing order"}), 400
+    order_id = find_existing_order(order_name)
+    if not order_id:
+        return jsonify({"error": "order not found"}), 404
+    odoo("sale.order", "write", [[order_id], {"x_dashboard_dismissed_hash": issue_hash}])
+    return jsonify({"status": "ok"})
 
 
 @app.route("/dashboard", methods=["GET"])
@@ -1130,10 +1207,15 @@ def embedded_app():
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
 <div id="content">Loading...</div>
 <script>{FILTER_JS}
-async function load(days) {{
-  document.getElementById('content').innerHTML = 'Loading...';
+let currentDays = 60;
+async function getAuthHeaders() {{
   const token = await shopify.idToken();
-  const resp = await fetch('/app/data?days=' + (days || 60), {{ headers: {{ 'Authorization': 'Bearer ' + token }} }});
+  return {{ 'Authorization': 'Bearer ' + token }};
+}}
+async function load(days) {{
+  currentDays = days || currentDays;
+  document.getElementById('content').innerHTML = 'Loading...';
+  const resp = await fetch('/app/data?days=' + currentDays, {{ headers: await getAuthHeaders() }});
   document.getElementById('content').innerHTML = await resp.text();
   const form = document.querySelector('#content form');
   if (form) {{
@@ -1143,6 +1225,7 @@ async function load(days) {{
     }});
   }}
   wireFilters();
+  wireActions(getAuthHeaders, function() {{ load(currentDays); }});
 }}
 load();
 </script>
