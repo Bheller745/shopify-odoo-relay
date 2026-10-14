@@ -818,14 +818,27 @@ def fetch_recent_shopify_orders(token, days):
     return orders
 
 
+def shopify_order_url(shopify_id):
+    handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
+    return f"https://admin.shopify.com/store/{handle}/orders/{shopify_id}"
+
+
+def odoo_order_url(odoo_id):
+    return f"{ODOO_URL}/web#model=sale.order&view_type=form&id={odoo_id}"
+
+
 def audit_sync(days):
     token = shopify_access_token()
     shopify_orders = [so for so in fetch_recent_shopify_orders(token, days)
                        if (so.get("source_name") or "").lower() != "pos"]
     names = [so["name"] for so in shopify_orders]
 
+    # Not checking invoice status here -- most orders are never meant to
+    # get a formal Odoo invoice (Shopify/its payment processor is already
+    # the real financial record for them), so "not invoiced" on its own
+    # isn't a sync problem worth flagging.
     odoo_orders = odoo("sale.order", "search_read", [[("name", "in", names)]], {"fields": [
-        "id", "name", "state", "locked", "x_invoice_checked",
+        "id", "name", "state", "locked",
         "x_refunded_amount", "x_delivery_review_needed", "x_has_open_return",
     ]}) if names else []
     odoo_by_name = {o["name"]: o for o in odoo_orders}
@@ -851,8 +864,6 @@ def audit_sync(days):
         else:
             if fin in ("paid", "partially_paid") and oo["state"] == "draft":
                 issues.append(f"Shopify is {fin} but Odoo order is still draft")
-            if fin == "paid" and not oo["x_invoice_checked"]:
-                issues.append("Paid in Shopify but not invoiced in Odoo")
             if fin == "paid" and fulfillment == "fulfilled" and not oo["locked"]:
                 issues.append("Fulfilled in Shopify but not marked shipped in Odoo")
             if oo["x_delivery_review_needed"]:
@@ -867,55 +878,159 @@ def audit_sync(days):
             if unmatched:
                 issues.append(f"Unmatched SKU line(s): {', '.join(unmatched)}")
 
+        customer = so.get("customer") or {}
+        customer_name = " ".join(filter(None, [customer.get("first_name"), customer.get("last_name")])).strip()
+        email = so.get("email") or customer.get("email") or ""
+
         rows.append({
             "name": name,
+            "shopify_id": so.get("id"),
+            "odoo_id": oo["id"] if oo else None,
             "financial_status": fin,
             "fulfillment_status": fulfillment,
             "total": so.get("total_price"),
+            "customer_name": customer_name,
+            "email": email,
+            "created_at": (so.get("created_at") or "")[:10],
             "in_odoo": bool(oo),
             "issues": issues,
         })
     return rows
 
 
+DASHBOARD_CSS = """
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; padding: 24px; color: #1a1a1a; background: #f6f6f7; }
+h1 { font-size: 20px; margin: 0 0 20px; }
+.cards { display: flex; gap: 12px; margin-bottom: 20px; }
+.card { background: #fff; border: 1px solid #e3e3e3; border-radius: 10px; padding: 14px 20px; min-width: 110px; }
+.card .num { font-size: 26px; font-weight: 650; display: block; }
+.card .label { font-size: 12px; color: #6d7175; text-transform: uppercase; letter-spacing: .03em; }
+.card.flagged .num { color: #d72c0d; }
+.card.clean .num { color: #008060; }
+.toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; background: #fff; border: 1px solid #e3e3e3; border-radius: 10px; padding: 12px 14px; }
+.toolbar input[type=text], .toolbar select, .toolbar input[type=number] { padding: 7px 10px; border: 1px solid #c9cccf; border-radius: 6px; font-size: 13px; }
+.toolbar input[type=text] { flex: 1; min-width: 180px; }
+.toolbar button { padding: 7px 14px; border-radius: 6px; border: 1px solid #c9cccf; background: #fff; cursor: pointer; font-size: 13px; }
+.toolbar button.primary { background: #008060; color: #fff; border-color: #008060; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; background: #fff; border-radius: 10px; overflow: hidden; border: 1px solid #e3e3e3; }
+td, th { padding: 9px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid #ededed; }
+th { background: #fafafa; color: #6d7175; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; position: sticky; top: 0; }
+tr:last-child td { border-bottom: none; }
+tr.row-flagged { background: #fff6f5; }
+tr:hover { background: #f1f6ff !important; }
+.issues { color: #d72c0d; }
+.issues.ok { color: #008060; }
+.links a { margin-right: 8px; font-size: 12px; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.badge-green { background: #d7f5e9; color: #006e43; }
+.badge-yellow { background: #fff2cc; color: #946800; }
+.badge-red { background: #fde3e0; color: #a0290f; }
+.badge-gray { background: #eceef0; color: #5c5f62; }
+.badge-blue { background: #e0edff; color: #1b4db3; }
+.muted { color: #8c9196; font-size: 12px; }
+"""
+
+FINANCIAL_BADGE = {
+    "paid": "green", "partially_paid": "yellow", "pending": "blue", "authorized": "blue",
+    "refunded": "gray", "partially_refunded": "yellow", "voided": "red",
+}
+FULFILLMENT_BADGE = {"fulfilled": "green", "partial": "yellow"}
+
+
+def badge(text, color_map):
+    color = color_map.get(text, "gray")
+    label = (text or "unfulfilled").replace("_", " ")
+    return f'<span class="badge badge-{color}">{label}</span>'
+
+
 def render_table_section(rows, days):
-    """Just the summary + table -- shared by the standalone /dashboard page
-    and the embedded /app page (which fetches this fragment client-side
-    and injects it, since the embedded shell itself has to load before
-    App Bridge can even produce a session token to authenticate the data
-    request with)."""
+    """Just the summary cards + toolbar + table -- shared by the standalone
+    /dashboard page and the embedded /app page (which fetches this
+    fragment client-side and injects it, since the embedded shell itself
+    has to load before App Bridge can even produce a session token to
+    authenticate the data request with). Filtering itself is wired up by
+    a small script living in each OUTER page template, not here --
+    <script> tags inside HTML set via innerHTML never execute, so the
+    filter logic has to live outside this fragment."""
     clean = sum(1 for r in rows if not r["issues"])
     flagged = len(rows) - clean
     body_rows = []
     for r in sorted(rows, key=lambda r: (not r["issues"], r["name"])):
-        row_color = "#fde8e8" if r["issues"] else "#e8f8ee"
         issues_html = "<br>".join(r["issues"]) if r["issues"] else "OK"
+        issues_class = "issues" if r["issues"] else "issues ok"
+        links = [f'<a href="{shopify_order_url(r["shopify_id"])}" target="_top">Shopify</a>']
+        if r["odoo_id"]:
+            links.append(f'<a href="{odoo_order_url(r["odoo_id"])}" target="_top">Odoo</a>')
+        search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
         body_rows.append(
-            f"<tr style='background:{row_color}'>"
-            f"<td>{r['name']}</td><td>{r['financial_status']}</td><td>{r['fulfillment_status']}</td>"
-            f"<td>${r['total']}</td><td>{issues_html}</td></tr>"
+            f'<tr class="{"row-flagged" if r["issues"] else ""}" '
+            f'data-flagged="{1 if r["issues"] else 0}" '
+            f'data-financial="{r["financial_status"] or ""}" '
+            f'data-fulfillment="{r["fulfillment_status"] or "unfulfilled"}" '
+            f'data-search="{search_blob}">'
+            f'<td><b>{r["name"]}</b><div class="muted">{r["created_at"]}</div></td>'
+            f'<td>{r["customer_name"] or "-"}<div class="muted">{r["email"] or ""}</div></td>'
+            f'<td>{badge(r["financial_status"], FINANCIAL_BADGE)}</td>'
+            f'<td>{badge(r["fulfillment_status"], FULFILLMENT_BADGE)}</td>'
+            f'<td>${r["total"]}</td>'
+            f'<td class="links">{"".join(links)}</td>'
+            f'<td class="{issues_class}">{issues_html}</td></tr>'
         )
-    return f"""<div class="summary">Checked last {days} days &mdash; {len(rows)} orders, <b>{flagged} flagged</b>, {clean} clean.</div>
-<form method="get">Days back: <input type="number" name="days" value="{days}" style="width:70px"> <button type="submit">Refresh</button></form>
-<table><tr><th>Order</th><th>Shopify Payment</th><th>Shopify Fulfillment</th><th>Total</th><th>Issues</th></tr>
+    return f"""<div class="cards">
+<div class="card"><span class="num">{len(rows)}</span><span class="label">Orders checked</span></div>
+<div class="card flagged"><span class="num">{flagged}</span><span class="label">Flagged</span></div>
+<div class="card clean"><span class="num">{clean}</span><span class="label">Clean</span></div>
+</div>
+<div class="toolbar">
+  <form method="get" style="display:flex;gap:8px;align-items:center;margin:0;">
+    <span class="muted">Days back</span>
+    <input type="number" name="days" value="{days}" style="width:70px">
+    <button type="submit" class="primary">Refresh</button>
+  </form>
+  <input type="text" id="f-search" placeholder="Search order #, customer, email...">
+  <select id="f-flag"><option value="">All rows</option><option value="1">Flagged only</option><option value="0">Clean only</option></select>
+  <select id="f-financial"><option value="">Any payment status</option><option value="paid">Paid</option><option value="partially_paid">Partially paid</option><option value="pending">Pending</option><option value="refunded">Refunded</option><option value="partially_refunded">Partially refunded</option><option value="voided">Voided</option></select>
+  <select id="f-fulfillment"><option value="">Any fulfillment</option><option value="fulfilled">Fulfilled</option><option value="partial">Partial</option><option value="unfulfilled">Unfulfilled</option></select>
+</div>
+<table id="sync-table"><thead><tr><th>Order</th><th>Customer</th><th>Payment</th><th>Fulfillment</th><th>Total</th><th>Links</th><th>Issues</th></tr></thead>
+<tbody>
 {''.join(body_rows)}
-</table>"""
+</tbody></table>"""
+
+
+FILTER_JS = """
+function wireFilters() {
+  const search = document.getElementById('f-search');
+  const flag = document.getElementById('f-flag');
+  const financial = document.getElementById('f-financial');
+  const fulfillment = document.getElementById('f-fulfillment');
+  if (!search) return;
+  function apply() {
+    const q = search.value.toLowerCase();
+    const rows = document.querySelectorAll('#sync-table tbody tr');
+    rows.forEach(function(row) {
+      const matchesSearch = !q || row.dataset.search.includes(q);
+      const matchesFlag = !flag.value || row.dataset.flagged === flag.value;
+      const matchesFinancial = !financial.value || row.dataset.financial === financial.value;
+      const matchesFulfillment = !fulfillment.value || row.dataset.fulfillment === fulfillment.value;
+      row.style.display = (matchesSearch && matchesFlag && matchesFinancial && matchesFulfillment) ? '' : 'none';
+    });
+  }
+  [search, flag, financial, fulfillment].forEach(function(el) { el.addEventListener('input', apply); });
+}
+"""
 
 
 def render_dashboard(rows, days):
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>920D Shopify/Odoo Sync Status</title>
-<style>
-body {{ font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #222; }}
-table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
-td, th {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; vertical-align: top; }}
-th {{ background: #333; color: #fff; }}
-h1 {{ font-size: 20px; }}
-.summary {{ margin-bottom: 16px; }}
-form {{ margin-bottom: 16px; }}
-</style></head><body>
+<style>{DASHBOARD_CSS}</style></head><body>
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
 {render_table_section(rows, days)}
+<script>{FILTER_JS}
+document.addEventListener('DOMContentLoaded', wireFilters);
+wireFilters();
+</script>
 </body></html>"""
 
 
@@ -990,18 +1105,10 @@ def embedded_app():
 <meta name="shopify-api-key" content="{SHOPIFY_CLIENT_ID}">
 <title>920D Sync Status</title>
 <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
-<style>
-body {{ font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #222; }}
-table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
-td, th {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; vertical-align: top; }}
-th {{ background: #333; color: #fff; }}
-h1 {{ font-size: 20px; }}
-.summary {{ margin-bottom: 16px; }}
-form {{ margin-bottom: 16px; }}
-</style></head><body>
+<style>{DASHBOARD_CSS}</style></head><body>
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
 <div id="content">Loading...</div>
-<script>
+<script>{FILTER_JS}
 async function load(days) {{
   document.getElementById('content').innerHTML = 'Loading...';
   const token = await shopify.idToken();
@@ -1014,6 +1121,7 @@ async function load(days) {{
       load(form.querySelector('input[name=days]').value);
     }});
   }}
+  wireFilters();
 }}
 load();
 </script>
