@@ -927,9 +927,12 @@ DASHBOARD_CSS = """
 .filter-toolbar input[type=text], .filter-toolbar select, .filter-toolbar input[type=number] { padding: 7px 10px; border: 1px solid #c9cccf; border-radius: 6px; font-size: 13px; }
 .filter-toolbar input[type=text] { flex: 1; min-width: 180px; }
 .links a { margin-right: 8px; font-size: 12px; }
-/* s-table-row has no confirmed tone/variant attribute for row-level tinting,
-   so this scoped fallback replicates the flagged-row highlight. */
-s-table-row[data-flagged="1"] { background: #fff6f5; }
+/* s-table-row renders through Shadow DOM, so page-level CSS can't reach
+   into it to tint the row background -- the status color bar is rendered
+   as real light-DOM content inside the Order cell instead, which works
+   reliably regardless of the row's own internal styling. */
+.order-cell { border-left: 4px solid #ccc; padding-left: 10px; margin-left: -6px; }
+.nowrap { white-space: nowrap; }
 """
 
 FINANCIAL_BADGE = {
@@ -986,6 +989,12 @@ def render_table_section(rows, days):
                 action_html = (f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
                                 f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
         search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
+        if r["dismissed"]:
+            bar_color = "#8c9196"
+        elif is_flagged:
+            bar_color = "#d72c0d"
+        else:
+            bar_color = "#008060"
         body_rows.append(
             f'<s-table-row '
             f'data-order="{r["name"]}" '
@@ -995,7 +1004,8 @@ def render_table_section(rows, days):
             f'data-financial="{r["financial_status"] or ""}" '
             f'data-fulfillment="{r["fulfillment_status"] or "unfulfilled"}" '
             f'data-search="{search_blob}">'
-            f'<s-table-cell><b>{r["name"]}</b><div class="muted">{r["created_at"]}</div></s-table-cell>'
+            f'<s-table-cell><div class="order-cell" style="border-left-color:{bar_color}">'
+            f'<b class="nowrap">{r["name"]}</b><div class="muted">{r["created_at"]}</div></div></s-table-cell>'
             f'<s-table-cell>{r["customer_name"] or "-"}<div class="muted">{r["email"] or ""}</div></s-table-cell>'
             f'<s-table-cell>{badge(r["financial_status"], FINANCIAL_BADGE)}</s-table-cell>'
             f'<s-table-cell>{badge(r["fulfillment_status"], FULFILLMENT_BADGE)}</s-table-cell>'
@@ -1096,6 +1106,10 @@ function patchRowAfterToggle(order, wasDismiss) {
       ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
       : '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button>';
     wireActionButton(actionCell.querySelector('s-button'));
+  }
+  const orderCell = row.querySelector('.order-cell');
+  if (orderCell) {
+    orderCell.style.borderLeftColor = wasDismiss ? '#8c9196' : '#d72c0d';
   }
   const issueCell = row.querySelector('.issue-cell');
   if (issueCell) {
