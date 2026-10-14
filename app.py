@@ -137,15 +137,40 @@ def order_discount_source(shopify_order):
     return "Website discount"
 
 
-def build_order_lines(shopify_order):
+def get_or_create_product(sku, item):
+    """Look up a product by SKU; if it genuinely doesn't exist in Odoo yet,
+    create a minimal placeholder instead of silently dropping the product
+    link (the historical bug this guards against: 38 old orders ended up
+    with unmatched-SKU lines that never got fixed because nothing flagged
+    them). The placeholder has no cost/category/BOM -- it's deliberately
+    bare so it's obviously incomplete, not mistaken for a real finished
+    catalog entry."""
+    found = odoo("product.template", "search", [[("default_code", "=", sku)]], {"limit": 1})
+    if found:
+        return found[0], False
+    new_id = odoo("product.template", "create", [{
+        "name": item.get("name") or item.get("title") or sku,
+        "default_code": sku,
+        "is_storable": True,
+        "sale_ok": True,
+        "list_price": float(item.get("price") or 0.0),
+    }])
+    return new_id, True
+
+
+def build_order_lines(shopify_order, new_products):
+    """new_products is a list the caller passes in and this appends to --
+    any SKU that had to be auto-created gets recorded there so the caller
+    can post a visible chatter warning on the order (see
+    _warn_new_products below)."""
     lines = []
     for item in shopify_order.get("line_items", []):
         sku = item.get("sku")
         product_id = None
         if sku:
-            found = odoo("product.template", "search", [[("default_code", "=", sku)]], {"limit": 1})
-            if found:
-                product_id = found[0]
+            product_id, was_created = get_or_create_product(sku, item)
+            if was_created:
+                new_products.append(sku)
         line_vals = {
             "name": item.get("name") or item.get("title") or sku or "Shopify line item",
             "product_uom_qty": item.get("quantity") or 1,
@@ -161,6 +186,19 @@ def build_order_lines(shopify_order):
             line_vals["product_id"] = product_id
         lines.append((0, 0, line_vals))
     return lines
+
+
+def warn_new_products(order_id, new_products):
+    if not new_products:
+        return
+    skus = ", ".join(new_products)
+    try:
+        odoo_safe("sale.order", "message_post", [[order_id]], {
+            "body": (f"⚠️ Auto-created new product(s) for SKU(s) not yet in Odoo: "
+                     f"{skus}. No cost, category, or BOM set yet -- needs review."),
+        })
+    except Exception:
+        pass  # warning is best-effort -- never block the real order sync over it
 
 
 def find_existing_order(order_ref):
@@ -440,6 +478,7 @@ def shopify_webhook():
             return jsonify({"error": "no customer email on order"}), 400
 
         discount_source = order_discount_source(payload)
+        new_products = []
 
         if existing_id:
             existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked", "x_backorder_checked"]})[0]
@@ -452,7 +491,7 @@ def shopify_webhook():
                 # blocks removing lines from a confirmed order (invoicing/
                 # delivery tracking), so confirmed orders keep their
                 # original lines and only get header fields refreshed here.
-                update_vals["order_line"] = [(5, 0, 0)] + build_order_lines(payload)
+                update_vals["order_line"] = [(5, 0, 0)] + build_order_lines(payload, new_products)
             odoo("sale.order", "write", [[existing_id], update_vals])
             new_id = existing_id
         else:
@@ -468,8 +507,9 @@ def shopify_webhook():
                 "partner_id": partner_id,
                 "client_order_ref": order_ref,
                 "x_discount_source": discount_source,
-                "order_line": build_order_lines(payload),
+                "order_line": build_order_lines(payload, new_products),
             }])
+        warn_new_products(new_id, new_products)
 
         financial_status = payload.get("financial_status")
         if financial_status in ("paid", "partially_paid") or payload.get("confirmed"):
