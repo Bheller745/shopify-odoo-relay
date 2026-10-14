@@ -15,15 +15,25 @@ commit real values to git):
     ODOO_LOGIN     e.g. bheller@920dcustom.com
     ODOO_PASSWORD  Odoo password or API key
     SHOPIFY_WEBHOOK_SECRET   from Shopify admin's webhook settings
+
+Optional -- only needed for the /dashboard read-only sync-status page:
+    SHOPIFY_STORE_DOMAIN    e.g. 920d.myshopify.com
+    SHOPIFY_CLIENT_ID       from the Shopify Dev Dashboard custom app
+    SHOPIFY_CLIENT_SECRET   from the same app
+    DASHBOARD_PASSWORD      HTTP Basic Auth password for /dashboard
 """
 import base64
 import hashlib
 import hmac
 import json
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 import xmlrpc.client
+from datetime import datetime, timedelta
 
-from flask import Flask, request, jsonify
+from flask import Flask, Response, request, jsonify
 
 app = Flask(__name__)
 
@@ -32,6 +42,12 @@ ODOO_DB = os.environ["ODOO_DB"]
 ODOO_LOGIN = os.environ["ODOO_LOGIN"]
 ODOO_PASSWORD = os.environ["ODOO_PASSWORD"]
 SHOPIFY_WEBHOOK_SECRET = os.environ["SHOPIFY_WEBHOOK_SECRET"]
+
+SHOPIFY_STORE_DOMAIN = os.environ.get("SHOPIFY_STORE_DOMAIN")
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID")
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET")
+DASHBOARD_PASSWORD = os.environ.get("DASHBOARD_PASSWORD")
+SHOPIFY_API_VERSION = "2024-10"
 
 _common = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/common", allow_none=True)
 _uid = _common.authenticate(ODOO_DB, ODOO_LOGIN, ODOO_PASSWORD, {})
@@ -761,6 +777,158 @@ def shopify_webhook():
         return jsonify({"status": "ok", "order_ref": order_ref, "odoo_order_id": new_id}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+def shopify_access_token():
+    """Dev Dashboard custom apps (required for any new custom app since
+    Shopify retired legacy custom apps in Jan 2026) don't hand out a
+    static Admin API token -- this requests a fresh one via the client
+    credentials grant every time instead. It's valid 24h, but re-fetching
+    per dashboard load is simpler and cheap enough not to bother caching."""
+    data = urllib.parse.urlencode({
+        "grant_type": "client_credentials",
+        "client_id": SHOPIFY_CLIENT_ID,
+        "client_secret": SHOPIFY_CLIENT_SECRET,
+    }).encode()
+    req = urllib.request.Request(f"https://{SHOPIFY_STORE_DOMAIN}/admin/oauth/access_token", data=data)
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())["access_token"]
+
+
+def fetch_recent_shopify_orders(token, days):
+    """Paginates via the Link header's rel="next" URL -- Shopify's REST
+    cursor-based pagination requires following that exact URL rather than
+    constructing subsequent pages manually (page_info tokens aren't
+    reusable across different query params)."""
+    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    url = (f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+           f"?status=any&limit=250&created_at_min={urllib.parse.quote(since)}")
+    orders = []
+    while url:
+        req = urllib.request.Request(url, headers={"X-Shopify-Access-Token": token})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            link_header = resp.headers.get("Link", "") or ""
+            data = json.loads(resp.read())
+        orders.extend(data.get("orders", []))
+        url = None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<> ")
+    return orders
+
+
+def audit_sync(days):
+    token = shopify_access_token()
+    shopify_orders = [so for so in fetch_recent_shopify_orders(token, days)
+                       if (so.get("source_name") or "").lower() != "pos"]
+    names = [so["name"] for so in shopify_orders]
+
+    odoo_orders = odoo("sale.order", "search_read", [[("name", "in", names)]], {"fields": [
+        "id", "name", "state", "locked", "x_invoice_checked",
+        "x_refunded_amount", "x_delivery_review_needed", "x_has_open_return",
+    ]}) if names else []
+    odoo_by_name = {o["name"]: o for o in odoo_orders}
+    odoo_ids = [o["id"] for o in odoo_orders]
+
+    unmatched_lines = odoo("sale.order.line", "search_read",
+        [[("order_id", "in", odoo_ids), ("display_type", "=", False), ("product_id", "=", False)]],
+        {"fields": ["order_id", "name"]}) if odoo_ids else []
+    unmatched_by_order = {}
+    for l in unmatched_lines:
+        unmatched_by_order.setdefault(l["order_id"][0], []).append(l["name"])
+
+    rows = []
+    for so in shopify_orders:
+        name = so["name"]
+        fin = so.get("financial_status")
+        fulfillment = so.get("fulfillment_status")
+        oo = odoo_by_name.get(name)
+        issues = []
+
+        if not oo:
+            issues.append("Missing from Odoo entirely")
+        else:
+            if fin in ("paid", "partially_paid") and oo["state"] == "draft":
+                issues.append(f"Shopify is {fin} but Odoo order is still draft")
+            if fin == "paid" and not oo["x_invoice_checked"]:
+                issues.append("Paid in Shopify but not invoiced in Odoo")
+            if fin == "paid" and fulfillment == "fulfilled" and not oo["locked"]:
+                issues.append("Fulfilled in Shopify but not marked shipped in Odoo")
+            if oo["x_delivery_review_needed"]:
+                issues.append("Flagged in Odoo for delivery review")
+            shopify_refunded = total_refunded(so)
+            odoo_refunded = oo["x_refunded_amount"] or 0.0
+            if abs(shopify_refunded - odoo_refunded) > 0.01:
+                issues.append(f"Refund mismatch: Shopify ${shopify_refunded:.2f} vs Odoo ${odoo_refunded:.2f}")
+            if oo["x_has_open_return"]:
+                issues.append("Has an open Shopify return")
+            unmatched = unmatched_by_order.get(oo["id"], [])
+            if unmatched:
+                issues.append(f"Unmatched SKU line(s): {', '.join(unmatched)}")
+
+        rows.append({
+            "name": name,
+            "financial_status": fin,
+            "fulfillment_status": fulfillment,
+            "total": so.get("total_price"),
+            "in_odoo": bool(oo),
+            "issues": issues,
+        })
+    return rows
+
+
+def render_dashboard(rows, days):
+    clean = sum(1 for r in rows if not r["issues"])
+    flagged = len(rows) - clean
+    body_rows = []
+    for r in sorted(rows, key=lambda r: (not r["issues"], r["name"])):
+        row_color = "#fde8e8" if r["issues"] else "#e8f8ee"
+        issues_html = "<br>".join(r["issues"]) if r["issues"] else "OK"
+        body_rows.append(
+            f"<tr style='background:{row_color}'>"
+            f"<td>{r['name']}</td><td>{r['financial_status']}</td><td>{r['fulfillment_status']}</td>"
+            f"<td>${r['total']}</td><td>{issues_html}</td></tr>"
+        )
+    html = f"""<!doctype html><html><head><meta charset="utf-8">
+<title>920D Shopify/Odoo Sync Status</title>
+<style>
+body {{ font-family: -apple-system, Arial, sans-serif; margin: 24px; color: #222; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
+td, th {{ border: 1px solid #ccc; padding: 6px 10px; text-align: left; vertical-align: top; }}
+th {{ background: #333; color: #fff; }}
+h1 {{ font-size: 20px; }}
+.summary {{ margin-bottom: 16px; }}
+form {{ margin-bottom: 16px; }}
+</style></head><body>
+<h1>920D Shopify &harr; Odoo Sync Status</h1>
+<div class="summary">Checked last {days} days &mdash; {len(rows)} orders, <b>{flagged} flagged</b>, {clean} clean.</div>
+<form method="get">Days back: <input type="number" name="days" value="{days}" style="width:70px"> <button type="submit">Refresh</button></form>
+<table><tr><th>Order</th><th>Shopify Payment</th><th>Shopify Fulfillment</th><th>Total</th><th>Issues</th></tr>
+{''.join(body_rows)}
+</table>
+</body></html>"""
+    return html
+
+
+def check_dashboard_auth():
+    auth = request.authorization
+    if not DASHBOARD_PASSWORD or not auth or not hmac.compare_digest(auth.password, DASHBOARD_PASSWORD):
+        return False
+    return True
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    days = min(int(request.args.get("days", 60)), 365)
+    try:
+        rows = audit_sync(days)
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+    return Response(render_dashboard(rows, days), mimetype="text/html")
 
 
 @app.route("/healthz", methods=["GET"])
