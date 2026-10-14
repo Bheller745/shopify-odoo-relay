@@ -827,6 +827,15 @@ def odoo_order_url(odoo_id):
     return f"{ODOO_URL}/web#model=sale.order&view_type=form&id={odoo_id}"
 
 
+def shopify_product_search_url(sku):
+    """Links an unmatched SKU to Shopify's own product search -- there's
+    nothing to link to in Odoo for these (the product doesn't exist there
+    yet, that's the whole issue), but it does exist in Shopify since
+    that's where the order line's SKU came from."""
+    handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
+    return f"https://admin.shopify.com/store/{handle}/products?query={urllib.parse.quote(sku)}"
+
+
 def audit_sync(days):
     token = shopify_access_token()
     shopify_orders = [so for so in fetch_recent_shopify_orders(token, days)
@@ -859,6 +868,7 @@ def audit_sync(days):
         oo = odoo_by_name.get(name)
         issues = []
 
+        unmatched_skus = []
         if not oo:
             issues.append("Missing from Odoo entirely")
         else:
@@ -874,9 +884,9 @@ def audit_sync(days):
                 issues.append(f"Refund mismatch: Shopify ${shopify_refunded:.2f} vs Odoo ${odoo_refunded:.2f}")
             if oo["x_has_open_return"]:
                 issues.append("Has an open Shopify return")
-            unmatched = unmatched_by_order.get(oo["id"], [])
-            if unmatched:
-                issues.append(f"Unmatched SKU line(s): {', '.join(unmatched)}")
+            unmatched_skus = unmatched_by_order.get(oo["id"], [])
+            if unmatched_skus:
+                issues.append(f"Unmatched SKU line(s): {', '.join(unmatched_skus)}")
 
         customer = so.get("customer") or {}
         customer_name = " ".join(filter(None, [customer.get("first_name"), customer.get("last_name")])).strip()
@@ -894,6 +904,7 @@ def audit_sync(days):
             "created_at": (so.get("created_at") or "")[:10],
             "in_odoo": bool(oo),
             "issues": issues,
+            "unmatched_skus": unmatched_skus,
         })
     return rows
 
@@ -956,7 +967,17 @@ def render_table_section(rows, days):
     flagged = len(rows) - clean
     body_rows = []
     for r in sorted(rows, key=lambda r: (not r["issues"], r["name"])):
-        issues_html = "<br>".join(r["issues"]) if r["issues"] else "OK"
+        display_issues = []
+        for issue in r["issues"]:
+            if issue.startswith("Unmatched SKU line(s): ") and r["unmatched_skus"]:
+                sku_links = ", ".join(
+                    f'<a href="{shopify_product_search_url(sku)}" target="_top">{sku}</a>'
+                    for sku in r["unmatched_skus"]
+                )
+                display_issues.append(f"Unmatched SKU line(s): {sku_links}")
+            else:
+                display_issues.append(issue)
+        issues_html = "<br>".join(display_issues) if display_issues else "OK"
         issues_class = "issues" if r["issues"] else "issues ok"
         links = [f'<a href="{shopify_order_url(r["shopify_id"])}" target="_top">Shopify</a>']
         if r["odoo_id"]:
