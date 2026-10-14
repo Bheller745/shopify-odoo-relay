@@ -931,7 +931,7 @@ DASHBOARD_CSS = """
    into it to tint the row background -- the status color bar is rendered
    as real light-DOM content inside the Order cell instead, which works
    reliably regardless of the row's own internal styling. */
-.order-cell { border-left: 4px solid #ccc; padding-left: 10px; margin-left: -6px; }
+.order-cell { border-left: 4px solid #ccc; padding-left: 8px; }
 .nowrap { white-space: nowrap; }
 """
 
