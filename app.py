@@ -922,52 +922,27 @@ def audit_sync(days):
 
 
 DASHBOARD_CSS = """
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; margin: 0; padding: 24px; color: #1a1a1a; background: #f6f6f7; }
-h1 { font-size: 20px; margin: 0 0 20px; }
-.cards { display: flex; gap: 12px; margin-bottom: 20px; }
-.card { background: #fff; border: 1px solid #e3e3e3; border-radius: 10px; padding: 14px 20px; min-width: 110px; }
-.card .num { font-size: 26px; font-weight: 650; display: block; }
-.card .label { font-size: 12px; color: #6d7175; text-transform: uppercase; letter-spacing: .03em; }
-.card.flagged .num { color: #d72c0d; }
-.card.clean .num { color: #008060; }
-.toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; background: #fff; border: 1px solid #e3e3e3; border-radius: 10px; padding: 12px 14px; }
-.toolbar input[type=text], .toolbar select, .toolbar input[type=number] { padding: 7px 10px; border: 1px solid #c9cccf; border-radius: 6px; font-size: 13px; }
-.toolbar input[type=text] { flex: 1; min-width: 180px; }
-.toolbar button { padding: 7px 14px; border-radius: 6px; border: 1px solid #c9cccf; background: #fff; cursor: pointer; font-size: 13px; }
-.toolbar button.primary { background: #008060; color: #fff; border-color: #008060; }
-table { border-collapse: collapse; width: 100%; font-size: 13px; background: #fff; border-radius: 10px; overflow: hidden; border: 1px solid #e3e3e3; }
-td, th { padding: 9px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid #ededed; }
-th { background: #fafafa; color: #6d7175; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; position: sticky; top: 0; }
-tr:last-child td { border-bottom: none; }
-tr.row-flagged { background: #fff6f5; }
-tr:hover { background: #f1f6ff !important; }
-.issues { color: #d72c0d; }
-.issues.ok { color: #008060; }
+.muted { color: #6d7175; font-size: 12px; }
+.filter-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+.filter-toolbar input[type=text], .filter-toolbar select, .filter-toolbar input[type=number] { padding: 7px 10px; border: 1px solid #c9cccf; border-radius: 6px; font-size: 13px; }
+.filter-toolbar input[type=text] { flex: 1; min-width: 180px; }
 .links a { margin-right: 8px; font-size: 12px; }
-.badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; white-space: nowrap; }
-.badge-green { background: #d7f5e9; color: #006e43; }
-.badge-yellow { background: #fff2cc; color: #946800; }
-.badge-red { background: #fde3e0; color: #a0290f; }
-.badge-gray { background: #eceef0; color: #5c5f62; }
-.badge-blue { background: #e0edff; color: #1b4db3; }
-.muted { color: #8c9196; font-size: 12px; }
-.dismiss-btn, .restore-btn { padding: 4px 10px; border-radius: 6px; border: 1px solid #c9cccf; background: #fff; cursor: pointer; font-size: 12px; }
-.dismiss-btn:hover { background: #fde3e0; border-color: #d72c0d; }
-.restore-btn:hover { background: #e0edff; border-color: #1b4db3; }
-.dismiss-btn:disabled, .restore-btn:disabled { opacity: .5; cursor: default; }
+/* s-table-row has no confirmed tone/variant attribute for row-level tinting,
+   so this scoped fallback replicates the flagged-row highlight. */
+s-table-row[data-flagged="1"] { background: #fff6f5; }
 """
 
 FINANCIAL_BADGE = {
-    "paid": "green", "partially_paid": "yellow", "pending": "blue", "authorized": "blue",
-    "refunded": "gray", "partially_refunded": "yellow", "voided": "red",
+    "paid": "success", "partially_paid": "warning", "pending": "info", "authorized": "info",
+    "refunded": "neutral", "partially_refunded": "warning", "voided": "critical",
 }
-FULFILLMENT_BADGE = {"fulfilled": "green", "partial": "yellow"}
+FULFILLMENT_BADGE = {"fulfilled": "success", "partial": "warning"}
 
 
 def badge(text, color_map):
-    color = color_map.get(text, "gray")
+    tone = color_map.get(text, "neutral")
     label = (text or "unfulfilled").replace("_", " ")
-    return f'<span class="badge badge-{color}">{label}</span>'
+    return f'<s-badge tone="{tone}">{label}</s-badge>'
 
 
 def render_table_section(rows, days):
@@ -989,7 +964,7 @@ def render_table_section(rows, days):
         for issue in r["issues"]:
             if issue.startswith("Unmatched SKU line(s): ") and r["unmatched_skus"]:
                 sku_links = ", ".join(
-                    f'<a href="{shopify_product_search_url(sku)}" target="_top">{sku}</a>'
+                    f'<a href="{shopify_product_search_url(sku)}" target="_blank" rel="noopener">{sku}</a>'
                     for sku in r["unmatched_skus"]
                 )
                 display_issues.append(f"Unmatched SKU line(s): {sku_links}")
@@ -997,55 +972,66 @@ def render_table_section(rows, days):
                 display_issues.append(issue)
         issues_html = "<br>".join(display_issues) if display_issues else "OK"
         if r["dismissed"]:
-            issues_html += ' <span class="badge badge-gray">Dismissed</span>'
+            issues_html += ' <s-badge tone="neutral">Dismissed</s-badge>'
         is_flagged = bool(r["issues"]) and not r["dismissed"]
-        issues_class = "issues" if is_flagged else "issues ok"
-        links = [f'<a href="{shopify_order_url(r["shopify_id"])}" target="_top">Shopify</a>']
+        links = [f'<a href="{shopify_order_url(r["shopify_id"])}" target="_blank" rel="noopener">Shopify</a>']
         if r["odoo_id"]:
-            links.append(f'<a href="{odoo_order_url(r["odoo_id"])}" target="_top">Odoo</a>')
+            links.append(f'<a href="{odoo_order_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>')
+        hash_val = r["issue_hash"] or ""
         action_html = "-"
         if r["issues"]:
             if r["dismissed"]:
-                action_html = f'<button class="restore-btn" data-order="{r["name"]}">Restore</button>'
+                action_html = f'<s-button variant="secondary" data-action="restore" data-order="{r["name"]}">Restore</s-button>'
             else:
-                action_html = f'<button class="dismiss-btn" data-order="{r["name"]}" data-hash="{r["issue_hash"]}">Dismiss</button>'
+                action_html = (f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
+                                f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
         search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
         body_rows.append(
-            f'<tr class="{"row-flagged" if is_flagged else ""}" '
+            f'<s-table-row '
+            f'data-order="{r["name"]}" '
+            f'data-hash="{hash_val}" '
             f'data-flagged="{1 if is_flagged else 0}" '
+            f'data-dismissed="{1 if r["dismissed"] else 0}" '
             f'data-financial="{r["financial_status"] or ""}" '
             f'data-fulfillment="{r["fulfillment_status"] or "unfulfilled"}" '
             f'data-search="{search_blob}">'
-            f'<td><b>{r["name"]}</b><div class="muted">{r["created_at"]}</div></td>'
-            f'<td>{r["customer_name"] or "-"}<div class="muted">{r["email"] or ""}</div></td>'
-            f'<td>{badge(r["financial_status"], FINANCIAL_BADGE)}</td>'
-            f'<td>{badge(r["fulfillment_status"], FULFILLMENT_BADGE)}</td>'
-            f'<td>${r["total"]}</td>'
-            f'<td class="links">{"".join(links)}</td>'
-            f'<td class="{issues_class}">{issues_html}</td>'
-            f'<td>{action_html}</td></tr>'
+            f'<s-table-cell><b>{r["name"]}</b><div class="muted">{r["created_at"]}</div></s-table-cell>'
+            f'<s-table-cell>{r["customer_name"] or "-"}<div class="muted">{r["email"] or ""}</div></s-table-cell>'
+            f'<s-table-cell>{badge(r["financial_status"], FINANCIAL_BADGE)}</s-table-cell>'
+            f'<s-table-cell>{badge(r["fulfillment_status"], FULFILLMENT_BADGE)}</s-table-cell>'
+            f'<s-table-cell>${r["total"]}</s-table-cell>'
+            f'<s-table-cell class="links">{"".join(links)}</s-table-cell>'
+            f'<s-table-cell class="issue-cell">{issues_html}</s-table-cell>'
+            f'<s-table-cell><span class="action-cell" data-order="{r["name"]}" data-hash="{hash_val}">{action_html}</span></s-table-cell>'
+            f'</s-table-row>'
         )
-    return f"""<div class="cards">
-<div class="card"><span class="num">{len(rows)}</span><span class="label">Orders checked</span></div>
-<div class="card flagged"><span class="num">{flagged}</span><span class="label">Flagged</span></div>
-<div class="card clean"><span class="num">{clean}</span><span class="label">Clean</span></div>
-<div class="card"><span class="num">{dismissed_count}</span><span class="label">Dismissed</span></div>
-</div>
-<div class="toolbar">
-  <form method="get" style="display:flex;gap:8px;align-items:center;margin:0;">
-    <span class="muted">Days back</span>
-    <input type="number" name="days" value="{days}" style="width:70px">
-    <button type="submit" class="primary">Refresh</button>
-  </form>
+    return f"""<s-stack gap="base">
+<s-stack direction="inline" gap="base">
+<s-section heading="Orders checked"><s-paragraph><span data-stat="checked">{len(rows)}</span></s-paragraph></s-section>
+<s-section heading="Flagged"><s-paragraph><span data-stat="flagged">{flagged}</span></s-paragraph></s-section>
+<s-section heading="Clean"><s-paragraph><span data-stat="clean">{clean}</span></s-paragraph></s-section>
+<s-section heading="Dismissed"><s-paragraph><span data-stat="dismissed">{dismissed_count}</span></s-paragraph></s-section>
+</s-stack>
+<div class="filter-toolbar">
+  <span class="muted">Days back</span>
+  <input type="number" id="f-days" value="{days}" style="width:70px">
+  <s-button variant="primary" id="refresh-btn">Refresh</s-button>
   <input type="text" id="f-search" placeholder="Search order #, customer, email...">
   <select id="f-flag"><option value="">All rows</option><option value="1">Flagged only</option><option value="0">Clean only</option></select>
   <select id="f-financial"><option value="">Any payment status</option><option value="paid">Paid</option><option value="partially_paid">Partially paid</option><option value="pending">Pending</option><option value="refunded">Refunded</option><option value="partially_refunded">Partially refunded</option><option value="voided">Voided</option></select>
   <select id="f-fulfillment"><option value="">Any fulfillment</option><option value="fulfilled">Fulfilled</option><option value="partial">Partial</option><option value="unfulfilled">Unfulfilled</option></select>
 </div>
-<table id="sync-table"><thead><tr><th>Order</th><th>Customer</th><th>Payment</th><th>Fulfillment</th><th>Total</th><th>Links</th><th>Issues</th><th>Action</th></tr></thead>
-<tbody>
+<s-table>
+<s-table-header-row>
+<s-table-header>Order</s-table-header><s-table-header>Customer</s-table-header><s-table-header>Payment</s-table-header>
+<s-table-header>Fulfillment</s-table-header><s-table-header>Total</s-table-header><s-table-header>Links</s-table-header>
+<s-table-header>Issues</s-table-header><s-table-header>Action</s-table-header>
+</s-table-header-row>
+<s-table-body id="sync-table-body">
 {''.join(body_rows)}
-</tbody></table>"""
+</s-table-body>
+</s-table>
+</s-stack>"""
 
 
 FILTER_JS = """
@@ -1057,7 +1043,7 @@ function wireFilters() {
   if (!search) return;
   function apply() {
     const q = search.value.toLowerCase();
-    const rows = document.querySelectorAll('#sync-table tbody tr');
+    const rows = document.querySelectorAll('#sync-table-body s-table-row');
     rows.forEach(function(row) {
       const matchesSearch = !q || row.dataset.search.includes(q);
       const matchesFlag = !flag.value || row.dataset.flagged === flag.value;
@@ -1069,37 +1055,127 @@ function wireFilters() {
   [search, flag, financial, fulfillment].forEach(function(el) { el.addEventListener('input', apply); });
 }
 
-async function dismissAction(btn, getAuthHeaders, reload) {
-  btn.disabled = true;
-  const isDismiss = btn.classList.contains('dismiss-btn');
-  const headers = Object.assign({'Content-Type': 'application/json'}, await getAuthHeaders());
-  await fetch('/dismiss', {
-    method: 'POST',
-    headers: headers,
-    body: JSON.stringify({order: btn.dataset.order, hash: isDismiss ? btn.dataset.hash : ''}),
-  });
-  reload();
+function setStat(key, value) {
+  const el = document.querySelector('[data-stat="' + key + '"]');
+  if (el) el.textContent = value;
 }
 
-function wireActions(getAuthHeaders, reload) {
-  document.querySelectorAll('.dismiss-btn, .restore-btn').forEach(function(btn) {
-    btn.addEventListener('click', function() { dismissAction(btn, getAuthHeaders, reload); });
+function recomputeSummary() {
+  const rows = document.querySelectorAll('#sync-table-body s-table-row');
+  let flagged = 0, dismissed = 0;
+  rows.forEach(function(r) {
+    if (r.dataset.dismissed === '1') dismissed++;
+    else if (r.dataset.flagged === '1') flagged++;
   });
+  setStat('flagged', flagged);
+  setStat('dismissed', dismissed);
+  setStat('clean', rows.length - flagged - dismissed);
+}
+
+function showActionError(order, message) {
+  console.error('Dismiss/restore failed for', order, message);
+  const container = document.querySelector('.action-cell[data-order="' + order + '"]');
+  if (!container) return;
+  let banner = container.querySelector('s-banner');
+  if (!banner) {
+    banner = document.createElement('s-banner');
+    banner.setAttribute('tone', 'critical');
+    container.appendChild(banner);
+  }
+  banner.innerHTML = '<s-paragraph>' + message + '</s-paragraph>';
+}
+
+function patchRowAfterToggle(order, wasDismiss) {
+  const row = document.querySelector('s-table-row[data-order="' + order + '"]');
+  if (!row) return;
+  row.dataset.dismissed = wasDismiss ? '1' : '0';
+  const actionCell = document.querySelector('.action-cell[data-order="' + order + '"]');
+  if (actionCell) {
+    const hash = actionCell.dataset.hash || '';
+    actionCell.innerHTML = wasDismiss
+      ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
+      : '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button>';
+    wireActionButton(actionCell.querySelector('s-button'));
+  }
+  const issueCell = row.querySelector('.issue-cell');
+  if (issueCell) {
+    const hasBadge = issueCell.querySelector('s-badge');
+    if (wasDismiss && !hasBadge) {
+      issueCell.insertAdjacentHTML('beforeend', ' <s-badge tone="neutral">Dismissed</s-badge>');
+    } else if (!wasDismiss && hasBadge) {
+      hasBadge.remove();
+    }
+  }
+  recomputeSummary();
+}
+
+async function dismissAction(btn) {
+  const order = btn.dataset.order;
+  const isDismiss = btn.dataset.action === 'dismiss';
+  btn.disabled = true;
+  try {
+    const headers = Object.assign({'Content-Type': 'application/json'}, await window.__dashAuthHeaders());
+    const resp = await fetch('/dismiss', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({order: order, hash: isDismiss ? btn.dataset.hash : ''}),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      showActionError(order, 'Request failed (' + resp.status + '): ' + text);
+      btn.disabled = false;
+      return;
+    }
+    patchRowAfterToggle(order, isDismiss);
+  } catch (err) {
+    showActionError(order, 'Error: ' + err.message);
+    btn.disabled = false;
+  }
+}
+
+function wireActionButton(btn) {
+  if (!btn) return;
+  btn.addEventListener('click', function() { dismissAction(btn); });
+}
+
+function wireActions(getAuthHeaders) {
+  window.__dashAuthHeaders = getAuthHeaders;
+  document.querySelectorAll('[data-action="dismiss"], [data-action="restore"]').forEach(wireActionButton);
+}
+
+function wireAll(getAuthHeaders, refreshFn) {
+  wireFilters();
+  wireActions(getAuthHeaders);
+  const refreshBtn = document.getElementById('refresh-btn');
+  if (refreshBtn) {
+    refreshBtn.addEventListener('click', function() {
+      const daysInput = document.getElementById('f-days');
+      refreshFn(daysInput ? daysInput.value : undefined);
+    });
+  }
 }
 """
 
 
 def render_dashboard(rows, days):
+    # Phase B (deferred): Refresh still does a full page reload here rather
+    # than the AJAX fetch+replace used by the embedded /app -- only Dismiss/
+    # Restore get the no-reload treatment for now, via the shared FILTER_JS.
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>920D Shopify/Odoo Sync Status</title>
+<script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
 <style>{DASHBOARD_CSS}</style></head><body>
-<h1>920D Shopify &harr; Odoo Sync Status</h1>
+<s-page heading="920D Shopify &harr; Odoo Sync Status">
 {render_table_section(rows, days)}
+</s-page>
 <script>{FILTER_JS}
 async function getAuthHeaders() {{ return {{}}; }}
-function reload() {{ location.reload(); }}
-wireFilters();
-wireActions(getAuthHeaders, reload);
+function refreshViaReload(days) {{
+  const url = new URL(location.href);
+  if (days) url.searchParams.set('days', days);
+  location.href = url.toString();
+}}
+wireAll(getAuthHeaders, refreshViaReload);
 </script>
 </body></html>"""
 
@@ -1203,9 +1279,11 @@ def embedded_app():
 <meta name="shopify-api-key" content="{SHOPIFY_CLIENT_ID}">
 <title>920D Sync Status</title>
 <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
+<script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
 <style>{DASHBOARD_CSS}</style></head><body>
-<h1>920D Shopify &harr; Odoo Sync Status</h1>
+<s-page heading="920D Shopify &harr; Odoo Sync Status">
 <div id="content">Loading...</div>
+</s-page>
 <script>{FILTER_JS}
 let currentDays = 60;
 async function getAuthHeaders() {{
@@ -1216,16 +1294,13 @@ async function load(days) {{
   currentDays = days || currentDays;
   document.getElementById('content').innerHTML = 'Loading...';
   const resp = await fetch('/app/data?days=' + currentDays, {{ headers: await getAuthHeaders() }});
-  document.getElementById('content').innerHTML = await resp.text();
-  const form = document.querySelector('#content form');
-  if (form) {{
-    form.addEventListener('submit', function(e) {{
-      e.preventDefault();
-      load(form.querySelector('input[name=days]').value);
-    }});
+  if (!resp.ok) {{
+    document.getElementById('content').innerHTML =
+      '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
+    return;
   }}
-  wireFilters();
-  wireActions(getAuthHeaders, function() {{ load(currentDays); }});
+  document.getElementById('content').innerHTML = await resp.text();
+  wireAll(getAuthHeaders, load);
 }}
 load();
 </script>
