@@ -1118,6 +1118,11 @@ DASHBOARD_CSS = """
    reliably regardless of the row's own internal styling. */
 .order-cell { border-left: 4px solid #ccc; padding-left: 8px; }
 .nowrap { white-space: nowrap; }
+/* The table can end up wider than the embedded iframe's viewport (long
+   issue text, stacked action buttons) -- scope the horizontal scroll to
+   just the table instead of letting content silently clip off-screen
+   with no way to reach it. */
+.table-scroll { overflow-x: auto; width: 100%; }
 /* s-page defaults to a constrained, form-like reading width -- this is a
    data table, not a form, so it should use the full available width. */
 s-page { max-width: none !important; width: 100% !important; }
@@ -1195,7 +1200,7 @@ def render_table_section(rows, days):
                                     f'data-order="{r["name"]}">Update Delivery</s-button>')
                 buttons.append(f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
                                 f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
-                action_html = '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + "".join(buttons) + '</div>'
+                action_html = '<div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start;">' + "".join(buttons) + '</div>'
         search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
         if r["dismissed"]:
             bar_color = "#8c9196"
@@ -1239,6 +1244,7 @@ def render_table_section(rows, days):
   <select id="f-financial"><option value="">Any payment status</option><option value="paid">Paid</option><option value="partially_paid">Partially paid</option><option value="pending">Pending</option><option value="refunded">Refunded</option><option value="partially_refunded">Partially refunded</option><option value="voided">Voided</option></select>
   <select id="f-fulfillment"><option value="">Any fulfillment</option><option value="fulfilled">Fulfilled</option><option value="partial">Partial</option><option value="unfulfilled">Unfulfilled</option></select>
 </div>
+<div class="table-scroll">
 <s-table>
 <s-table-header-row>
 <s-table-header>Order</s-table-header><s-table-header>Customer</s-table-header><s-table-header>Payment</s-table-header>
@@ -1249,6 +1255,7 @@ def render_table_section(rows, days):
 {''.join(body_rows)}
 </s-table-body>
 </s-table>
+</div>
 </s-stack>"""
 
 
@@ -1303,6 +1310,7 @@ def render_products_section(rows):
   <input type="text" id="p-search" placeholder="Search SKU or product title...">
   <select id="p-status"><option value="">All products</option><option value="unmatched">Missing from Odoo</option><option value="missing_bom">Missing BOM</option><option value="ok">Fully set up</option></select>
 </div>
+<div class="table-scroll">
 <s-table>
 <s-table-header-row>
 <s-table-header>SKU</s-table-header><s-table-header>Product</s-table-header><s-table-header>Status</s-table-header><s-table-header>Links</s-table-header><s-table-header>Action</s-table-header>
@@ -1311,6 +1319,7 @@ def render_products_section(rows):
 {''.join(body_rows)}
 </s-table-body>
 </s-table>
+</div>
 </s-stack>"""
 
 
@@ -1384,7 +1393,7 @@ function patchRowAfterToggle(order, wasDismiss) {
     }
     actionCell.innerHTML = wasDismiss
       ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
-      : '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + fixHtml +
+      : '<div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start;">' + fixHtml +
         '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button></div>';
     actionCell.querySelectorAll('s-button[data-action="dismiss"], s-button[data-action="restore"]').forEach(wireActionButton);
     actionCell.querySelectorAll('s-button[data-action="fix"]').forEach(wireFixButton);
