@@ -950,16 +950,31 @@ def audit_products():
         for f in found:
             odoo_by_sku[f["default_code"]] = f["id"]
 
+    # A Shopify-sold item with no BOM can't actually be built through a
+    # Manufacturing Order -- distinct from "missing from Odoo entirely"
+    # (the product record exists, but nothing tells the floor how to make
+    # it). Batched the same way as the SKU match above, one query instead
+    # of one per product.
+    template_ids = list(odoo_by_sku.values())
+    has_bom = set()
+    for i in range(0, len(template_ids), CHUNK):
+        chunk = template_ids[i:i + CHUNK]
+        boms = odoo("mrp.bom", "search_read", [[("product_tmpl_id", "in", chunk)]],
+                    {"fields": ["product_tmpl_id"]})
+        has_bom.update(b["product_tmpl_id"][0] for b in boms)
+
     rows = []
     for sku in skus:
         info = sku_info[sku]
+        odoo_id = odoo_by_sku.get(sku)
         rows.append({
             "sku": sku,
             "title": info["title"],
             "variant_title": info["variant_title"] if info["variant_title"] != "Default Title" else "",
             "status": info["status"],
             "shopify_product_id": info["shopify_product_id"],
-            "odoo_id": odoo_by_sku.get(sku),
+            "odoo_id": odoo_id,
+            "missing_bom": bool(odoo_id) and odoo_id not in has_bom,
         })
     return rows
 
@@ -1221,26 +1236,36 @@ def render_table_section(rows, days):
 
 
 def render_products_section(rows):
-    matched = sum(1 for r in rows if r["odoo_id"])
-    unmatched = len(rows) - matched
+    unmatched = sum(1 for r in rows if not r["odoo_id"])
+    missing_bom = sum(1 for r in rows if r["missing_bom"])
+    matched_ok = len(rows) - unmatched - missing_bom
     body_rows = []
-    for r in sorted(rows, key=lambda r: (bool(r["odoo_id"]), r["title"], r["sku"])):
-        bar_color = "#008060" if r["odoo_id"] else "#d72c0d"
+    for r in sorted(rows, key=lambda r: (bool(r["odoo_id"]) and not r["missing_bom"], r["title"], r["sku"])):
         title = r["title"]
         if r["variant_title"]:
             title += f' <span class="muted">({r["variant_title"]})</span>'
         shopify_link = f'<a href="{shopify_product_url(r["shopify_product_id"])}" target="_blank" rel="noopener">Shopify</a>'
-        if r["odoo_id"]:
-            odoo_cell = f'<a href="{odoo_product_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>'
-            status_badge = '<s-badge tone="success">Matched</s-badge>'
-            action_html = "-"
-        else:
+        if not r["odoo_id"]:
+            bar_color = "#d72c0d"
+            status = "unmatched"
             odoo_cell = "-"
             status_badge = '<s-badge tone="critical">Missing from Odoo</s-badge>'
             action_html = (f'<span class="action-cell" data-sku="{r["sku"]}">'
                             f'<s-button variant="primary" data-action="fix-product" data-sku="{r["sku"]}">Create in Odoo</s-button></span>')
+        elif r["missing_bom"]:
+            bar_color = "#b98900"
+            status = "missing_bom"
+            odoo_cell = f'<a href="{odoo_product_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>'
+            status_badge = '<s-badge tone="warning">Missing BOM</s-badge>'
+            action_html = "-"
+        else:
+            bar_color = "#008060"
+            status = "ok"
+            odoo_cell = f'<a href="{odoo_product_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>'
+            status_badge = '<s-badge tone="success">Matched</s-badge>'
+            action_html = "-"
         body_rows.append(
-            f'<s-table-row data-sku="{r["sku"]}" data-matched="{1 if r["odoo_id"] else 0}" '
+            f'<s-table-row data-sku="{r["sku"]}" data-status="{status}" '
             f'data-search="{(r["sku"] + " " + r["title"]).lower()}">'
             f'<s-table-cell><div class="order-cell" style="border-left-color:{bar_color}">'
             f'<b class="nowrap">{r["sku"]}</b></div></s-table-cell>'
@@ -1253,12 +1278,13 @@ def render_products_section(rows):
     return f"""<s-stack gap="base">
 <div style="display:flex; gap:12px; width:100%;">
 <s-section heading="SKUs checked" style="flex:1"><s-paragraph>{len(rows)}</s-paragraph></s-section>
-<s-section heading="Matched" style="flex:1"><s-paragraph>{matched}</s-paragraph></s-section>
+<s-section heading="Fully set up" style="flex:1"><s-paragraph>{matched_ok}</s-paragraph></s-section>
+<s-section heading="Missing BOM" style="flex:1"><s-paragraph>{missing_bom}</s-paragraph></s-section>
 <s-section heading="Missing from Odoo" style="flex:1"><s-paragraph>{unmatched}</s-paragraph></s-section>
 </div>
 <div class="filter-toolbar">
   <input type="text" id="p-search" placeholder="Search SKU or product title...">
-  <select id="p-matched"><option value="">All products</option><option value="0">Missing from Odoo only</option><option value="1">Matched only</option></select>
+  <select id="p-status"><option value="">All products</option><option value="unmatched">Missing from Odoo</option><option value="missing_bom">Missing BOM</option><option value="ok">Fully set up</option></select>
 </div>
 <s-table>
 <s-table-header-row>
@@ -1443,18 +1469,18 @@ function wireAll(getAuthHeaders, refreshFn) {
 
 function wireProductFilters() {
   const search = document.getElementById('p-search');
-  const matched = document.getElementById('p-matched');
+  const status = document.getElementById('p-status');
   if (!search) return;
   function apply() {
     const q = search.value.toLowerCase();
     const rows = document.querySelectorAll('#products-table-body s-table-row');
     rows.forEach(function(row) {
       const matchesSearch = !q || row.dataset.search.includes(q);
-      const matchesFilter = !matched.value || row.dataset.matched === matched.value;
+      const matchesFilter = !status.value || row.dataset.status === status.value;
       row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
     });
   }
-  [search, matched].forEach(function(el) { el.addEventListener('input', apply); });
+  [search, status].forEach(function(el) { el.addEventListener('input', apply); });
   wireProductFixButtons();
 }
 
@@ -1500,11 +1526,13 @@ async function fixProductAction(btn) {
     if (resultWindow) resultWindow.location.href = odooUrl;
     const row = document.querySelector('#products-table-body s-table-row[data-sku="' + sku + '"]');
     if (row) {
-      row.dataset.matched = '1';
+      // A freshly created product has no BOM yet -- "missing_bom", not
+      // fully "ok", until one gets added in the tab that just opened.
+      row.dataset.status = 'missing_bom';
       const orderCell = row.querySelector('.order-cell');
-      if (orderCell) orderCell.style.borderLeftColor = '#008060';
+      if (orderCell) orderCell.style.borderLeftColor = '#b98900';
       const cells = row.querySelectorAll('s-table-cell');
-      if (cells[2]) cells[2].innerHTML = '<s-badge tone="success">Matched</s-badge>';
+      if (cells[2]) cells[2].innerHTML = '<s-badge tone="warning">Missing BOM</s-badge>';
       if (cells[3]) {
         const shopifyLink = cells[3].querySelector('a');
         cells[3].innerHTML = (shopifyLink ? shopifyLink.outerHTML : '') +
