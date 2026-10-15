@@ -606,6 +606,128 @@ def handle_return_webhook(topic, payload):
     odoo_safe("sale.order", "message_post", [[order_id]], {"body": body})
 
 
+def sync_order_from_payload(payload):
+    """Core order-sync logic: create-or-update the matching sale.order from
+    a real Shopify order payload, plus everything downstream of that
+    (confirm, backorder MOs, auto-invoice, refunds, delivery/lock). Shared
+    by the live webhook (orders/create, orders/updated) AND the dashboard's
+    manual "Fix: create in Odoo" action for orders the webhook never
+    caught -- both need the exact same real behavior, not a simplified
+    duplicate that could silently diverge from it over time."""
+    order_ref = payload.get("name") or str(payload.get("id"))
+    existing_id = find_existing_order(order_ref)
+    partner_id = find_or_create_partner(payload)
+    if not partner_id:
+        raise ValueError("no customer email on order")
+
+    discount_source = order_discount_source(payload)
+    new_products = []
+
+    if existing_id:
+        existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked", "x_backorder_checked", "x_refunded_amount"]})[0]
+        existing_state = existing["state"]
+        invoice_checked = existing["x_invoice_checked"]
+        backorder_checked = existing["x_backorder_checked"]
+        already_refunded = existing["x_refunded_amount"] or 0.0
+        update_vals = {"partner_id": partner_id, "x_discount_source": discount_source}
+        if existing_state == "draft":
+            # Safe to fully rebuild lines only pre-confirmation -- Odoo
+            # blocks removing lines from a confirmed order (invoicing/
+            # delivery tracking), so confirmed orders keep their
+            # original lines and only get header fields refreshed here.
+            update_vals["order_line"] = [(5, 0, 0)] + build_order_lines(payload, new_products)
+        odoo("sale.order", "write", [[existing_id], update_vals])
+        new_id = existing_id
+    else:
+        invoice_checked = False
+        backorder_checked = False
+        already_refunded = 0.0
+        new_id = odoo("sale.order", "create", [{
+            # Explicitly set name = order_ref so the Odoo order number
+            # IS the Shopify order number (e.g. "920-36218") instead of
+            # Odoo's own auto-generated S00001-style sequence. This only
+            # bypasses the sequence for this one record -- it keeps
+            # counting normally for anything else that doesn't set name.
+            "name": order_ref,
+            "partner_id": partner_id,
+            "client_order_ref": order_ref,
+            "x_discount_source": discount_source,
+            # Stored so a later Return webhook (a separate Shopify
+            # resource that only carries the numeric order_id, never
+            # the human-readable order name/number) can find this
+            # order directly -- no callback to Shopify's API needed.
+            "x_shopify_order_id": str(payload.get("id") or ""),
+            "order_line": build_order_lines(payload, new_products),
+        }])
+    warn_new_products(new_id, new_products)
+
+    financial_status = payload.get("financial_status")
+    if financial_status in ("paid", "partially_paid") or payload.get("confirmed"):
+        try:
+            odoo("sale.order", "action_confirm", [[new_id]])
+        except Exception:
+            pass  # already confirmed or not confirmable yet -- not fatal
+
+        # Only start production once payment is real -- avoids committing
+        # shop floor capacity to orders that might not go through. Gated
+        # on x_backorder_checked (not "is this a new order") so a
+        # mid-request failure-and-retry doesn't silently skip it forever.
+        if not backorder_checked:
+            create_backorder_mos(new_id, order_ref)
+            odoo("sale.order", "write", [[new_id], {"x_backorder_checked": True}])
+
+        # Only auto-invoice+pay on a real, fully-paid order -- a
+        # partially_paid order genuinely only has PART of the money in,
+        # so auto-marking the whole invoice paid would misrepresent
+        # reality. Gated on x_invoice_checked (not "is this new") so a
+        # mid-request failure-and-retry doesn't silently skip it forever.
+        if financial_status == "paid" and not invoice_checked:
+            try:
+                auto_invoice_and_pay(new_id, order_ref)
+            except Exception:
+                pass  # invoicing issue -- not fatal, doesn't block the order sync itself
+            odoo("sale.order", "write", [[new_id], {"x_invoice_checked": True}])
+
+    # Refunds (full or partial) land as orders/updated webhooks with a
+    # growing "refunds" array and financial_status flipped to
+    # "refunded"/"partially_refunded" -- handled independently of the
+    # block above since a refund can arrive well after the order was
+    # paid+invoiced, with financial_status no longer even "paid" by
+    # then. Only meaningful once there's a real invoice to credit
+    # against (invoice_checked), and diffed against what's already
+    # been processed so Shopify's at-least-once retries never double
+    # the reversal.
+    if invoice_checked:
+        refunded_now = total_refunded(payload)
+        delta = refunded_now - already_refunded
+        if delta > 0.01:
+            try:
+                process_refund(new_id, order_ref, delta)
+                odoo("sale.order", "write", [[new_id], {"x_refunded_amount": refunded_now}])
+            except Exception as e:
+                odoo_safe("sale.order", "message_post", [[new_id]], {
+                    "body": f"Shopify refund of ${delta:.2f} could not be auto-reconciled ({str(e)[:300]}) -- needs manual review."
+                })
+
+    # "Completed" = locked. An order is only truly done once it's fully
+    # paid AND fully shipped -- partial payment or partial fulfillment
+    # doesn't count. Checked on every delivery (create + updates) since
+    # fulfillment almost always happens via a later orders/updated
+    # webhook, not the initial create. Idempotent: writing locked=True
+    # on an already-locked order is a harmless no-op.
+    if financial_status == "paid" and payload.get("fulfillment_status") == "fulfilled":
+        try:
+            try_ship_delivery(new_id, payload)
+        except Exception:
+            pass  # delivery issue -- not fatal, doesn't block the order sync itself
+        try:
+            odoo("sale.order", "write", [[new_id], {"locked": True}])
+        except Exception:
+            pass  # not confirmed yet or otherwise not lockable -- not fatal
+
+    return new_id
+
+
 @app.route("/webhook/shopify", methods=["POST"])
 def shopify_webhook():
     raw_body = request.get_data()
@@ -665,116 +787,7 @@ def shopify_webhook():
                         })
             return jsonify({"status": "cancelled", "order_ref": order_ref}), 200
 
-        existing_id = find_existing_order(order_ref)
-        partner_id = find_or_create_partner(payload)
-        if not partner_id:
-            return jsonify({"error": "no customer email on order"}), 400
-
-        discount_source = order_discount_source(payload)
-        new_products = []
-
-        if existing_id:
-            existing = odoo("sale.order", "read", [[existing_id]], {"fields": ["state", "x_invoice_checked", "x_backorder_checked", "x_refunded_amount"]})[0]
-            existing_state = existing["state"]
-            invoice_checked = existing["x_invoice_checked"]
-            backorder_checked = existing["x_backorder_checked"]
-            already_refunded = existing["x_refunded_amount"] or 0.0
-            update_vals = {"partner_id": partner_id, "x_discount_source": discount_source}
-            if existing_state == "draft":
-                # Safe to fully rebuild lines only pre-confirmation -- Odoo
-                # blocks removing lines from a confirmed order (invoicing/
-                # delivery tracking), so confirmed orders keep their
-                # original lines and only get header fields refreshed here.
-                update_vals["order_line"] = [(5, 0, 0)] + build_order_lines(payload, new_products)
-            odoo("sale.order", "write", [[existing_id], update_vals])
-            new_id = existing_id
-        else:
-            invoice_checked = False
-            backorder_checked = False
-            already_refunded = 0.0
-            new_id = odoo("sale.order", "create", [{
-                # Explicitly set name = order_ref so the Odoo order number
-                # IS the Shopify order number (e.g. "920-36218") instead of
-                # Odoo's own auto-generated S00001-style sequence. This only
-                # bypasses the sequence for this one record -- it keeps
-                # counting normally for anything else that doesn't set name.
-                "name": order_ref,
-                "partner_id": partner_id,
-                "client_order_ref": order_ref,
-                "x_discount_source": discount_source,
-                # Stored so a later Return webhook (a separate Shopify
-                # resource that only carries the numeric order_id, never
-                # the human-readable order name/number) can find this
-                # order directly -- no callback to Shopify's API needed.
-                "x_shopify_order_id": str(payload.get("id") or ""),
-                "order_line": build_order_lines(payload, new_products),
-            }])
-        warn_new_products(new_id, new_products)
-
-        financial_status = payload.get("financial_status")
-        if financial_status in ("paid", "partially_paid") or payload.get("confirmed"):
-            try:
-                odoo("sale.order", "action_confirm", [[new_id]])
-            except Exception:
-                pass  # already confirmed or not confirmable yet -- not fatal
-
-            # Only start production once payment is real -- avoids committing
-            # shop floor capacity to orders that might not go through. Gated
-            # on x_backorder_checked (not "is this a new order") so a
-            # mid-request failure-and-retry doesn't silently skip it forever.
-            if not backorder_checked:
-                create_backorder_mos(new_id, order_ref)
-                odoo("sale.order", "write", [[new_id], {"x_backorder_checked": True}])
-
-            # Only auto-invoice+pay on a real, fully-paid order -- a
-            # partially_paid order genuinely only has PART of the money in,
-            # so auto-marking the whole invoice paid would misrepresent
-            # reality. Gated on x_invoice_checked (not "is this new") so a
-            # mid-request failure-and-retry doesn't silently skip it forever.
-            if financial_status == "paid" and not invoice_checked:
-                try:
-                    auto_invoice_and_pay(new_id, order_ref)
-                except Exception:
-                    pass  # invoicing issue -- not fatal, doesn't block the order sync itself
-                odoo("sale.order", "write", [[new_id], {"x_invoice_checked": True}])
-
-        # Refunds (full or partial) land as orders/updated webhooks with a
-        # growing "refunds" array and financial_status flipped to
-        # "refunded"/"partially_refunded" -- handled independently of the
-        # block above since a refund can arrive well after the order was
-        # paid+invoiced, with financial_status no longer even "paid" by
-        # then. Only meaningful once there's a real invoice to credit
-        # against (invoice_checked), and diffed against what's already
-        # been processed so Shopify's at-least-once retries never double
-        # the reversal.
-        if invoice_checked:
-            refunded_now = total_refunded(payload)
-            delta = refunded_now - already_refunded
-            if delta > 0.01:
-                try:
-                    process_refund(new_id, order_ref, delta)
-                    odoo("sale.order", "write", [[new_id], {"x_refunded_amount": refunded_now}])
-                except Exception as e:
-                    odoo_safe("sale.order", "message_post", [[new_id]], {
-                        "body": f"Shopify refund of ${delta:.2f} could not be auto-reconciled ({str(e)[:300]}) -- needs manual review."
-                    })
-
-        # "Completed" = locked. An order is only truly done once it's fully
-        # paid AND fully shipped -- partial payment or partial fulfillment
-        # doesn't count. Checked on every delivery (create + updates) since
-        # fulfillment almost always happens via a later orders/updated
-        # webhook, not the initial create. Idempotent: writing locked=True
-        # on an already-locked order is a harmless no-op.
-        if financial_status == "paid" and payload.get("fulfillment_status") == "fulfilled":
-            try:
-                try_ship_delivery(new_id, payload)
-            except Exception:
-                pass  # delivery issue -- not fatal, doesn't block the order sync itself
-            try:
-                odoo("sale.order", "write", [[new_id], {"locked": True}])
-            except Exception:
-                pass  # not confirmed yet or otherwise not lockable -- not fatal
-
+        new_id = sync_order_from_payload(payload)
         return jsonify({"status": "ok", "order_ref": order_ref, "odoo_order_id": new_id}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -835,6 +848,20 @@ def fetch_all_shopify_products(token):
             if 'rel="next"' in part:
                 url = part.split(";")[0].strip().strip("<> ")
     return products
+
+
+def fetch_shopify_order_by_name(token, name):
+    """Looks up one real order's full payload by its Shopify name (e.g.
+    "920-36449") -- used by the dashboard's "Fix" action, which only knows
+    the order name from the audit, not the full order JSON the way the
+    live webhook already has it handed to it."""
+    url = (f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
+           f"?status=any&name={urllib.parse.quote(name)}")
+    req = urllib.request.Request(url, headers={"X-Shopify-Access-Token": token})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read())
+    orders = data.get("orders", [])
+    return orders[0] if orders else None
 
 
 def audit_products():
@@ -1078,8 +1105,13 @@ def render_table_section(rows, days):
             if r["dismissed"]:
                 action_html = f'<s-button variant="secondary" data-action="restore" data-order="{r["name"]}">Restore</s-button>'
             else:
-                action_html = (f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
+                buttons = []
+                if "Missing from Odoo entirely" in r["issues"]:
+                    buttons.append(f'<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" '
+                                    f'data-order="{r["name"]}">Create in Odoo</s-button>')
+                buttons.append(f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
                                 f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
+                action_html = '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + "".join(buttons) + '</div>'
         search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
         if r["dismissed"]:
             bar_color = "#8c9196"
@@ -1241,10 +1273,17 @@ function patchRowAfterToggle(order, wasDismiss) {
   const actionCell = document.querySelector('.action-cell[data-order="' + order + '"]');
   if (actionCell) {
     const hash = actionCell.dataset.hash || '';
+    const issueText = (row.querySelector('.issue-cell') || {}).textContent || '';
+    const needsFixButton = !wasDismiss && issueText.indexOf('Missing from Odoo entirely') !== -1;
+    const fixHtml = needsFixButton
+      ? '<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" data-order="' + order + '">Create in Odoo</s-button>'
+      : '';
     actionCell.innerHTML = wasDismiss
       ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
-      : '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button>';
-    wireActionButton(actionCell.querySelector('s-button'));
+      : '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + fixHtml +
+        '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button></div>';
+    actionCell.querySelectorAll('s-button[data-action="dismiss"], s-button[data-action="restore"]').forEach(wireActionButton);
+    actionCell.querySelectorAll('s-button[data-action="fix"]').forEach(wireFixButton);
   }
   const orderCell = row.querySelector('.order-cell');
   if (orderCell) {
@@ -1291,12 +1330,50 @@ function wireActionButton(btn) {
   btn.addEventListener('click', function() { dismissAction(btn); });
 }
 
+async function fixAction(btn) {
+  const order = btn.dataset.order;
+  const issue = btn.dataset.fixIssue;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Working...';
+  try {
+    const headers = Object.assign({'Content-Type': 'application/json'}, await window.__dashAuthHeaders());
+    const resp = await fetch('/fix', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({order: order, issue: issue}),
+    });
+    if (!resp.ok) {
+      const text = await resp.text();
+      showActionError(order, 'Fix failed (' + resp.status + '): ' + text);
+      btn.disabled = false;
+      btn.textContent = originalText;
+      return;
+    }
+    // Unlike dismiss/restore, a real fix can change many things about this
+    // row (it now exists in Odoo, may be confirmed/invoiced/locked too) --
+    // a full refetch is the only way to reflect that accurately.
+    if (window.__dashRefresh) window.__dashRefresh();
+  } catch (err) {
+    showActionError(order, 'Error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
+function wireFixButton(btn) {
+  if (!btn) return;
+  btn.addEventListener('click', function() { fixAction(btn); });
+}
+
 function wireActions(getAuthHeaders) {
   window.__dashAuthHeaders = getAuthHeaders;
   document.querySelectorAll('[data-action="dismiss"], [data-action="restore"]').forEach(wireActionButton);
+  document.querySelectorAll('[data-action="fix"]').forEach(wireFixButton);
 }
 
 function wireAll(getAuthHeaders, refreshFn) {
+  window.__dashRefresh = function() { refreshFn(); };
   wireFilters();
   wireActions(getAuthHeaders);
   const refreshBtn = document.getElementById('refresh-btn');
@@ -1382,6 +1459,36 @@ def dismiss_issue():
         return jsonify({"error": "order not found"}), 404
     odoo("sale.order", "write", [[order_id], {"x_dashboard_dismissed_hash": issue_hash}])
     return jsonify({"status": "ok"})
+
+
+@app.route("/fix", methods=["POST"])
+def fix_issue():
+    """Applies a real fix for one specific issue type, reusing the exact
+    same logic the live webhook uses rather than a simplified duplicate.
+    Currently only "missing_from_odoo" is implemented (create the order in
+    Odoo from Shopify's real current data) -- other issue types don't have
+    a safe one-click fix (e.g. a refund mismatch needs a human to look at
+    WHY before any action is taken)."""
+    if not check_any_dashboard_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    order_name = data.get("order")
+    issue_type = data.get("issue")
+    if not order_name:
+        return jsonify({"error": "missing order"}), 400
+
+    if issue_type != "missing_from_odoo":
+        return jsonify({"error": f"no automatic fix available for issue type: {issue_type}"}), 400
+
+    try:
+        token = shopify_access_token()
+        payload = fetch_shopify_order_by_name(token, order_name)
+        if not payload:
+            return jsonify({"error": "order not found in Shopify"}), 404
+        new_id = sync_order_from_payload(payload)
+        return jsonify({"status": "ok", "odoo_id": new_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/dashboard", methods=["GET"])
