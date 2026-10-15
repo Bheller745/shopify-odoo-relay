@@ -818,6 +818,73 @@ def fetch_recent_shopify_orders(token, days):
     return orders
 
 
+def fetch_all_shopify_products(token):
+    """Same Link-header pagination pattern as fetch_recent_shopify_orders,
+    just for the full catalog instead of a date-windowed set of orders --
+    there's no meaningful "days back" concept for a product catalog."""
+    url = f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json?limit=250"
+    products = []
+    while url:
+        req = urllib.request.Request(url, headers={"X-Shopify-Access-Token": token})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            link_header = resp.headers.get("Link", "") or ""
+            data = json.loads(resp.read())
+        products.extend(data.get("products", []))
+        url = None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<> ")
+    return products
+
+
+def audit_products():
+    """Checks every real Shopify SKU (one per variant) against Odoo's
+    catalog by default_code. Deliberately one-directional (Shopify -> Odoo
+    only, not the reverse): Odoo's catalog also contains thousands of raw-
+    material/component products that were never meant to be sellable on
+    Shopify at all, so "Odoo products missing from Shopify" would mostly
+    be noise, not real gaps. A SKU sold on Shopify with nothing matching
+    in Odoo is the one direction that's unambiguously a real problem."""
+    token = shopify_access_token()
+    shopify_products = fetch_all_shopify_products(token)
+
+    skus, sku_info = [], {}
+    for p in shopify_products:
+        for v in p.get("variants", []):
+            sku = (v.get("sku") or "").strip()
+            if not sku or sku in sku_info:
+                continue
+            skus.append(sku)
+            sku_info[sku] = {
+                "shopify_product_id": p.get("id"),
+                "title": p.get("title") or sku,
+                "variant_title": v.get("title"),
+                "status": p.get("status"),
+            }
+
+    odoo_by_sku = {}
+    CHUNK = 500
+    for i in range(0, len(skus), CHUNK):
+        chunk = skus[i:i + CHUNK]
+        found = odoo("product.template", "search_read", [[("default_code", "in", chunk)]],
+                      {"fields": ["id", "default_code"]})
+        for f in found:
+            odoo_by_sku[f["default_code"]] = f["id"]
+
+    rows = []
+    for sku in skus:
+        info = sku_info[sku]
+        rows.append({
+            "sku": sku,
+            "title": info["title"],
+            "variant_title": info["variant_title"] if info["variant_title"] != "Default Title" else "",
+            "status": info["status"],
+            "shopify_product_id": info["shopify_product_id"],
+            "odoo_id": odoo_by_sku.get(sku),
+        })
+    return rows
+
+
 def shopify_order_url(shopify_id):
     handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
     return f"https://admin.shopify.com/store/{handle}/orders/{shopify_id}"
@@ -834,6 +901,19 @@ def shopify_product_search_url(sku):
     that's where the order line's SKU came from."""
     handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
     return f"https://admin.shopify.com/store/{handle}/products?query={urllib.parse.quote(sku)}"
+
+
+def shopify_product_url(product_id):
+    """Direct link to a specific product's real edit page -- used once we
+    already know the exact Shopify product_id (the catalog audit), as
+    opposed to shopify_product_search_url above which only has a SKU
+    string to go on."""
+    handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
+    return f"https://admin.shopify.com/store/{handle}/products/{product_id}"
+
+
+def odoo_product_url(odoo_id):
+    return f"{ODOO_URL}/web#model=product.template&view_type=form&id={odoo_id}"
 
 
 def audit_sync(days):
@@ -1047,6 +1127,53 @@ def render_table_section(rows, days):
 </s-stack>"""
 
 
+def render_products_section(rows):
+    matched = sum(1 for r in rows if r["odoo_id"])
+    unmatched = len(rows) - matched
+    body_rows = []
+    for r in sorted(rows, key=lambda r: (bool(r["odoo_id"]), r["title"], r["sku"])):
+        bar_color = "#008060" if r["odoo_id"] else "#d72c0d"
+        title = r["title"]
+        if r["variant_title"]:
+            title += f' <span class="muted">({r["variant_title"]})</span>'
+        shopify_link = f'<a href="{shopify_product_url(r["shopify_product_id"])}" target="_blank" rel="noopener">Shopify</a>'
+        if r["odoo_id"]:
+            odoo_cell = f'<a href="{odoo_product_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>'
+            status_badge = '<s-badge tone="success">Matched</s-badge>'
+        else:
+            odoo_cell = "-"
+            status_badge = '<s-badge tone="critical">Missing from Odoo</s-badge>'
+        body_rows.append(
+            f'<s-table-row data-matched="{1 if r["odoo_id"] else 0}" '
+            f'data-search="{(r["sku"] + " " + r["title"]).lower()}">'
+            f'<s-table-cell><div class="order-cell" style="border-left-color:{bar_color}">'
+            f'<b class="nowrap">{r["sku"]}</b></div></s-table-cell>'
+            f'<s-table-cell>{title}</s-table-cell>'
+            f'<s-table-cell>{status_badge}</s-table-cell>'
+            f'<s-table-cell class="links">{shopify_link} {odoo_cell}</s-table-cell>'
+            f'</s-table-row>'
+        )
+    return f"""<s-stack gap="base">
+<div style="display:flex; gap:12px; width:100%;">
+<s-section heading="SKUs checked" style="flex:1"><s-paragraph>{len(rows)}</s-paragraph></s-section>
+<s-section heading="Matched" style="flex:1"><s-paragraph>{matched}</s-paragraph></s-section>
+<s-section heading="Missing from Odoo" style="flex:1"><s-paragraph>{unmatched}</s-paragraph></s-section>
+</div>
+<div class="filter-toolbar">
+  <input type="text" id="p-search" placeholder="Search SKU or product title...">
+  <select id="p-matched"><option value="">All products</option><option value="0">Missing from Odoo only</option><option value="1">Matched only</option></select>
+</div>
+<s-table>
+<s-table-header-row>
+<s-table-header>SKU</s-table-header><s-table-header>Product</s-table-header><s-table-header>Status</s-table-header><s-table-header>Links</s-table-header>
+</s-table-header-row>
+<s-table-body id="products-table-body">
+{''.join(body_rows)}
+</s-table-body>
+</s-table>
+</s-stack>"""
+
+
 FILTER_JS = """
 function wireFilters() {
   const search = document.getElementById('f-search');
@@ -1170,6 +1297,22 @@ function wireAll(getAuthHeaders, refreshFn) {
       refreshFn(daysInput ? daysInput.value : undefined);
     });
   }
+}
+
+function wireProductFilters() {
+  const search = document.getElementById('p-search');
+  const matched = document.getElementById('p-matched');
+  if (!search) return;
+  function apply() {
+    const q = search.value.toLowerCase();
+    const rows = document.querySelectorAll('#products-table-body s-table-row');
+    rows.forEach(function(row) {
+      const matchesSearch = !q || row.dataset.search.includes(q);
+      const matchesFilter = !matched.value || row.dataset.matched === matched.value;
+      row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+    });
+  }
+  [search, matched].forEach(function(el) { el.addEventListener('input', apply); });
 }
 """
 
@@ -1299,27 +1442,56 @@ def embedded_app():
 <script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
 <style>{DASHBOARD_CSS}</style></head><body>
 <s-page heading="920D Shopify &harr; Odoo Sync Status">
-<div id="content">Loading...</div>
+<div style="display:flex; gap:8px; margin-bottom:16px;">
+  <s-button variant="primary" id="tab-orders-btn">Orders</s-button>
+  <s-button variant="secondary" id="tab-products-btn">Products</s-button>
+</div>
+<div id="orders-content">Loading...</div>
+<div id="products-content" style="display:none">Loading...</div>
 </s-page>
 <script>{FILTER_JS}
 let currentDays = 60;
+let productsLoaded = false;
 async function getAuthHeaders() {{
   const token = await shopify.idToken();
   return {{ 'Authorization': 'Bearer ' + token }};
 }}
-async function load(days) {{
+async function loadOrders(days) {{
   currentDays = days || currentDays;
-  document.getElementById('content').innerHTML = 'Loading...';
+  const el = document.getElementById('orders-content');
+  el.innerHTML = 'Loading...';
   const resp = await fetch('/app/data?days=' + currentDays, {{ headers: await getAuthHeaders() }});
   if (!resp.ok) {{
-    document.getElementById('content').innerHTML =
-      '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
+    el.innerHTML = '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
     return;
   }}
-  document.getElementById('content').innerHTML = await resp.text();
-  wireAll(getAuthHeaders, load);
+  el.innerHTML = await resp.text();
+  wireAll(getAuthHeaders, loadOrders);
 }}
-load();
+async function loadProducts() {{
+  const el = document.getElementById('products-content');
+  el.innerHTML = 'Loading...';
+  const resp = await fetch('/app/products-data', {{ headers: await getAuthHeaders() }});
+  if (!resp.ok) {{
+    el.innerHTML = '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
+    return;
+  }}
+  el.innerHTML = await resp.text();
+  wireProductFilters();
+  productsLoaded = true;
+}}
+function switchTab(tab) {{
+  const ordersBtn = document.getElementById('tab-orders-btn');
+  const productsBtn = document.getElementById('tab-products-btn');
+  document.getElementById('orders-content').style.display = (tab === 'orders') ? '' : 'none';
+  document.getElementById('products-content').style.display = (tab === 'products') ? '' : 'none';
+  ordersBtn.setAttribute('variant', tab === 'orders' ? 'primary' : 'secondary');
+  productsBtn.setAttribute('variant', tab === 'products' ? 'primary' : 'secondary');
+  if (tab === 'products' && !productsLoaded) loadProducts();
+}}
+document.getElementById('tab-orders-btn').addEventListener('click', function() {{ switchTab('orders'); }});
+document.getElementById('tab-products-btn').addEventListener('click', function() {{ switchTab('products'); }});
+loadOrders();
 </script>
 </body></html>"""
     resp = Response(html, mimetype="text/html")
@@ -1329,12 +1501,15 @@ load();
     return resp
 
 
-@app.route("/app/data", methods=["GET"])
-def app_data():
+def check_session_token_auth():
     auth_header = request.headers.get("Authorization", "")
     token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
-    payload = verify_shopify_id_token(token) if token else None
-    if not payload:
+    return bool(token and verify_shopify_id_token(token))
+
+
+@app.route("/app/data", methods=["GET"])
+def app_data():
+    if not check_session_token_auth():
         return Response("Invalid session token", 401, {"X-Shopify-Retry-Invalid-Session-Request": "1"})
     if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
         return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
@@ -1344,6 +1519,19 @@ def app_data():
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
     return Response(render_table_section(rows, days), mimetype="text/html")
+
+
+@app.route("/app/products-data", methods=["GET"])
+def app_products_data():
+    if not check_session_token_auth():
+        return Response("Invalid session token", 401, {"X-Shopify-Retry-Invalid-Session-Request": "1"})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    try:
+        rows = audit_products()
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+    return Response(render_products_section(rows), mimetype="text/html")
 
 
 @app.route("/healthz", methods=["GET"])
