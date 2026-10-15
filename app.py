@@ -1660,11 +1660,19 @@ def render_dashboard(rows, days):
 </div>
 <script>{FILTER_JS}
 const ODOO_BASE_URL = {json.dumps(ODOO_URL)};
+let currentDays = {days};
 async function getAuthHeaders() {{ return {{}}; }}
-function refreshViaReload(days) {{
-  const url = new URL(location.href);
-  if (days) url.searchParams.set('days', days);
-  location.href = url.toString();
+async function loadOrders(days) {{
+  currentDays = days || currentDays;
+  const el = document.getElementById('orders-content');
+  el.innerHTML = 'Loading...';
+  const resp = await fetch('/dashboard/data?days=' + currentDays, {{ headers: await getAuthHeaders() }});
+  if (!resp.ok) {{
+    el.innerHTML = '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
+    return;
+  }}
+  el.innerHTML = await resp.text();
+  wireAll(getAuthHeaders, loadOrders);
 }}
 let productsLoaded = false;
 async function loadProducts() {{
@@ -1688,7 +1696,7 @@ function switchTab(tab) {{
 }}
 document.getElementById('tab-orders-btn').addEventListener('click', function() {{ switchTab('orders'); }});
 document.getElementById('tab-products-btn').addEventListener('click', function() {{ switchTab('products'); }});
-wireAll(getAuthHeaders, refreshViaReload);
+wireAll(getAuthHeaders, loadOrders);
 </script>
 </body></html>"""
 
