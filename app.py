@@ -1476,6 +1476,11 @@ async function fixProductAction(btn) {
   btn.disabled = true;
   const originalText = btn.textContent;
   btn.textContent = 'Working...';
+  // Opened synchronously, right in the click handler, and redirected once
+  // the real product id is known -- popup blockers allow window.open()
+  // during a direct user gesture, but block it if called after the
+  // fetch's await (by then the gesture context has expired).
+  const resultWindow = window.open('about:blank', '_blank');
   try {
     const headers = Object.assign({'Content-Type': 'application/json'}, await window.__dashAuthHeaders());
     const resp = await fetch('/fix-product', {
@@ -1488,8 +1493,11 @@ async function fixProductAction(btn) {
       showProductActionError(sku, 'Fix failed (' + resp.status + '): ' + (result.error || resp.statusText));
       btn.disabled = false;
       btn.textContent = originalText;
+      if (resultWindow) resultWindow.close();
       return;
     }
+    const odooUrl = ODOO_BASE_URL + '/web#model=product.template&view_type=form&id=' + result.odoo_id;
+    if (resultWindow) resultWindow.location.href = odooUrl;
     const row = document.querySelector('#products-table-body s-table-row[data-sku="' + sku + '"]');
     if (row) {
       row.dataset.matched = '1';
@@ -1499,7 +1507,6 @@ async function fixProductAction(btn) {
       if (cells[2]) cells[2].innerHTML = '<s-badge tone="success">Matched</s-badge>';
       if (cells[3]) {
         const shopifyLink = cells[3].querySelector('a');
-        const odooUrl = ODOO_BASE_URL + '/web#model=product.template&view_type=form&id=' + result.odoo_id;
         cells[3].innerHTML = (shopifyLink ? shopifyLink.outerHTML : '') +
           ' <a href="' + odooUrl + '" target="_blank" rel="noopener">Odoo</a>';
       }
@@ -1509,6 +1516,7 @@ async function fixProductAction(btn) {
     showProductActionError(sku, 'Error: ' + err.message);
     btn.disabled = false;
     btn.textContent = originalText;
+    if (resultWindow) resultWindow.close();
   }
 }
 
