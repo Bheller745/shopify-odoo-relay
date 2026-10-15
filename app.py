@@ -1163,11 +1163,13 @@ def render_table_section(rows, days):
         display_issues = []
         for issue in r["issues"]:
             if issue.startswith("Unmatched SKU line(s): ") and r["unmatched_skus"]:
-                sku_links = ", ".join(
-                    f'<a href="{shopify_product_search_url(sku)}" target="_blank" rel="noopener">{sku}</a>'
+                sku_bits = ", ".join(
+                    f'<a href="{shopify_product_search_url(sku)}" target="_blank" rel="noopener">{sku}</a> '
+                    f'<span class="action-cell" data-sku="{sku}">'
+                    f'<s-button variant="primary" data-action="fix-sku" data-sku="{sku}" data-order="{r["name"]}">Create SKU</s-button></span>'
                     for sku in r["unmatched_skus"]
                 )
-                display_issues.append(f"Unmatched SKU line(s): {sku_links}")
+                display_issues.append(f"Unmatched SKU line(s): {sku_bits}")
             else:
                 display_issues.append(issue)
         issues_html = "<br>".join(display_issues) if display_issues else "OK"
@@ -1459,10 +1461,47 @@ function wireFixButton(btn) {
   btn.addEventListener('click', function() { fixAction(btn); });
 }
 
+async function fixSkuAction(btn) {
+  const sku = btn.dataset.sku;
+  const order = btn.dataset.order;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Working...';
+  try {
+    const headers = Object.assign({'Content-Type': 'application/json'}, await window.__dashAuthHeaders());
+    const resp = await fetch('/fix-product', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({sku: sku, order: order}),
+    });
+    const result = await resp.json().catch(function() { return {}; });
+    if (!resp.ok) {
+      showProductActionError(sku, 'Fix failed (' + resp.status + '): ' + (result.error || resp.statusText));
+      btn.disabled = false;
+      btn.textContent = originalText;
+      return;
+    }
+    // The order's row can change in several ways (line attached or not,
+    // issue list shrinking) -- same reasoning as fixAction above, a full
+    // refetch is the only way to reflect that accurately.
+    if (window.__dashRefresh) window.__dashRefresh();
+  } catch (err) {
+    showProductActionError(sku, 'Error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
+function wireSkuFixButton(btn) {
+  if (!btn) return;
+  btn.addEventListener('click', function() { fixSkuAction(btn); });
+}
+
 function wireActions(getAuthHeaders) {
   window.__dashAuthHeaders = getAuthHeaders;
   document.querySelectorAll('[data-action="dismiss"], [data-action="restore"]').forEach(wireActionButton);
   document.querySelectorAll('[data-action="fix"]').forEach(wireFixButton);
+  document.querySelectorAll('[data-action="fix-sku"]').forEach(wireSkuFixButton);
 }
 
 function wireAll(getAuthHeaders, refreshFn) {
@@ -1693,24 +1732,57 @@ def fix_issue():
         return jsonify({"error": str(e)}), 500
 
 
+def try_attach_sku_to_order_line(order_name, sku, template_id):
+    """Best-effort: if the order that flagged this SKU as unmatched still
+    has an editable (not-yet-invoiced) line for it, attach the real
+    product now that it exists. Silently does nothing if the order is
+    already invoiced/locked -- Odoo blocks changing the product on an
+    already-invoiced line by design (confirmed earlier this session), and
+    that's correct behavior to respect here, not something to force past."""
+    if not order_name:
+        return False
+    order_id = find_existing_order(order_name)
+    if not order_id:
+        return False
+    line = odoo("sale.order.line", "search",
+                [[("order_id", "=", order_id), ("name", "=", sku), ("product_id", "=", False)]], {"limit": 1})
+    if not line:
+        return False
+    variant = odoo("product.product", "search", [[("product_tmpl_id", "=", template_id)]], {"limit": 1})
+    if not variant:
+        return False
+    try:
+        odoo("sale.order.line", "write", [line, {"product_id": variant[0]}])
+        return True
+    except Exception:
+        return False
+
+
 @app.route("/fix-product", methods=["POST"])
 def fix_product():
     """Creates one missing product in Odoo from its real current Shopify
     data (see create_odoo_product_from_shopify). Shopify's REST API has no
     way to look up a single product by variant SKU directly, so this pulls
     the full catalog again and finds the match -- the same cost as loading
-    the Products tab itself, acceptable for a one-off manual click."""
+    the Products tab itself, acceptable for a one-off manual click.
+
+    Optional "order" param: also tries to attach the product to that
+    order's matching unmatched-SKU line, since this same action is called
+    from both the Products tab (no order context) and the Orders tab's
+    "Create SKU" button (has one)."""
     if not check_any_dashboard_auth():
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(force=True, silent=True) or {}
     sku = data.get("sku")
+    order_name = data.get("order")
     if not sku:
         return jsonify({"error": "missing sku"}), 400
 
     try:
         existing = odoo("product.template", "search", [[("default_code", "=", sku)]], {"limit": 1})
         if existing:
-            return jsonify({"status": "ok", "odoo_id": existing[0], "note": "already existed"})
+            line_attached = try_attach_sku_to_order_line(order_name, sku, existing[0])
+            return jsonify({"status": "ok", "odoo_id": existing[0], "note": "already existed", "line_attached": line_attached})
 
         token = shopify_access_token()
         products = fetch_all_shopify_products(token)
@@ -1726,7 +1798,8 @@ def fix_product():
             return jsonify({"error": "SKU not found in Shopify"}), 404
 
         new_id = create_odoo_product_from_shopify(*match)
-        return jsonify({"status": "ok", "odoo_id": new_id})
+        line_attached = try_attach_sku_to_order_line(order_name, sku, new_id)
+        return jsonify({"status": "ok", "odoo_id": new_id, "line_attached": line_attached})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
