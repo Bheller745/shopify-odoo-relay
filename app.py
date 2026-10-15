@@ -27,6 +27,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -173,6 +174,57 @@ def get_or_create_product(sku, item):
         "list_price": float(item.get("price") or 0.0),
     }])
     return new_id, True
+
+
+def strip_html(html):
+    if not html:
+        return ""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+
+
+WEIGHT_TO_KG = {"kg": 1.0, "g": 0.001, "lb": 0.453592, "oz": 0.0283495}
+
+
+def create_odoo_product_from_shopify(product, variant):
+    """Deliberate, full catalog-audit creation -- unlike get_or_create_product
+    above (a bare emergency placeholder created mid-order so nothing gets
+    silently dropped), this pulls everything real Shopify has for the
+    product: description, barcode, weight, and the actual product image,
+    not just name/SKU/price."""
+    title = product.get("title") or variant.get("sku")
+    variant_title = variant.get("title")
+    if variant_title and variant_title != "Default Title":
+        title = f"{title} - {variant_title}"
+
+    vals = {
+        "name": title,
+        "default_code": variant.get("sku"),
+        "is_storable": True,
+        "sale_ok": True,
+        "list_price": float(variant.get("price") or 0.0),
+    }
+    if variant.get("barcode"):
+        vals["barcode"] = variant["barcode"]
+    description = strip_html(product.get("body_html"))
+    if description:
+        vals["description_sale"] = description
+    weight = variant.get("weight")
+    weight_unit = (variant.get("weight_unit") or "kg").lower()
+    if weight and weight_unit in WEIGHT_TO_KG:
+        vals["weight"] = round(float(weight) * WEIGHT_TO_KG[weight_unit], 4)
+
+    new_id = odoo("product.template", "create", [vals])
+
+    image_url = (product.get("image") or {}).get("src")
+    if image_url:
+        try:
+            req = urllib.request.Request(image_url)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                image_b64 = base64.b64encode(resp.read()).decode()
+            odoo("product.template", "write", [[new_id], {"image_1920": image_b64}])
+        except Exception:
+            pass  # image fetch failing shouldn't block the rest of the product existing
+    return new_id
 
 
 def build_order_lines(shopify_order, new_products):
@@ -1181,17 +1233,21 @@ def render_products_section(rows):
         if r["odoo_id"]:
             odoo_cell = f'<a href="{odoo_product_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>'
             status_badge = '<s-badge tone="success">Matched</s-badge>'
+            action_html = "-"
         else:
             odoo_cell = "-"
             status_badge = '<s-badge tone="critical">Missing from Odoo</s-badge>'
+            action_html = (f'<span class="action-cell" data-sku="{r["sku"]}">'
+                            f'<s-button variant="primary" data-action="fix-product" data-sku="{r["sku"]}">Create in Odoo</s-button></span>')
         body_rows.append(
-            f'<s-table-row data-matched="{1 if r["odoo_id"] else 0}" '
+            f'<s-table-row data-sku="{r["sku"]}" data-matched="{1 if r["odoo_id"] else 0}" '
             f'data-search="{(r["sku"] + " " + r["title"]).lower()}">'
             f'<s-table-cell><div class="order-cell" style="border-left-color:{bar_color}">'
             f'<b class="nowrap">{r["sku"]}</b></div></s-table-cell>'
             f'<s-table-cell>{title}</s-table-cell>'
             f'<s-table-cell>{status_badge}</s-table-cell>'
             f'<s-table-cell class="links">{shopify_link} {odoo_cell}</s-table-cell>'
+            f'<s-table-cell>{action_html}</s-table-cell>'
             f'</s-table-row>'
         )
     return f"""<s-stack gap="base">
@@ -1206,7 +1262,7 @@ def render_products_section(rows):
 </div>
 <s-table>
 <s-table-header-row>
-<s-table-header>SKU</s-table-header><s-table-header>Product</s-table-header><s-table-header>Status</s-table-header><s-table-header>Links</s-table-header>
+<s-table-header>SKU</s-table-header><s-table-header>Product</s-table-header><s-table-header>Status</s-table-header><s-table-header>Links</s-table-header><s-table-header>Action</s-table-header>
 </s-table-header-row>
 <s-table-body id="products-table-body">
 {''.join(body_rows)}
@@ -1399,6 +1455,67 @@ function wireProductFilters() {
     });
   }
   [search, matched].forEach(function(el) { el.addEventListener('input', apply); });
+  wireProductFixButtons();
+}
+
+function showProductActionError(sku, message) {
+  console.error('Fix failed for', sku, message);
+  const container = document.querySelector('.action-cell[data-sku="' + sku + '"]');
+  if (!container) return;
+  let banner = container.querySelector('s-banner');
+  if (!banner) {
+    banner = document.createElement('s-banner');
+    banner.setAttribute('tone', 'critical');
+    container.appendChild(banner);
+  }
+  banner.innerHTML = '<s-paragraph>' + message + '</s-paragraph>';
+}
+
+async function fixProductAction(btn) {
+  const sku = btn.dataset.sku;
+  btn.disabled = true;
+  const originalText = btn.textContent;
+  btn.textContent = 'Working...';
+  try {
+    const headers = Object.assign({'Content-Type': 'application/json'}, await window.__dashAuthHeaders());
+    const resp = await fetch('/fix-product', {
+      method: 'POST',
+      headers: headers,
+      body: JSON.stringify({sku: sku}),
+    });
+    const result = await resp.json().catch(function() { return {}; });
+    if (!resp.ok) {
+      showProductActionError(sku, 'Fix failed (' + resp.status + '): ' + (result.error || resp.statusText));
+      btn.disabled = false;
+      btn.textContent = originalText;
+      return;
+    }
+    const row = document.querySelector('#products-table-body s-table-row[data-sku="' + sku + '"]');
+    if (row) {
+      row.dataset.matched = '1';
+      const orderCell = row.querySelector('.order-cell');
+      if (orderCell) orderCell.style.borderLeftColor = '#008060';
+      const cells = row.querySelectorAll('s-table-cell');
+      if (cells[2]) cells[2].innerHTML = '<s-badge tone="success">Matched</s-badge>';
+      if (cells[3]) {
+        const shopifyLink = cells[3].querySelector('a');
+        const odooUrl = ODOO_BASE_URL + '/web#model=product.template&view_type=form&id=' + result.odoo_id;
+        cells[3].innerHTML = (shopifyLink ? shopifyLink.outerHTML : '') +
+          ' <a href="' + odooUrl + '" target="_blank" rel="noopener">Odoo</a>';
+      }
+      if (cells[4]) cells[4].innerHTML = '-';
+    }
+  } catch (err) {
+    showProductActionError(sku, 'Error: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = originalText;
+  }
+}
+
+function wireProductFixButtons() {
+  document.querySelectorAll('[data-action="fix-product"]').forEach(function(btn) {
+    btn.addEventListener('click', function() { fixProductAction(btn); });
+  });
 }
 """
 
@@ -1423,6 +1540,7 @@ def render_dashboard(rows, days):
 <div id="products-content" style="display:none">Loading...</div>
 </s-page>
 <script>{FILTER_JS}
+const ODOO_BASE_URL = {json.dumps(ODOO_URL)};
 async function getAuthHeaders() {{ return {{}}; }}
 function refreshViaReload(days) {{
   const url = new URL(location.href);
@@ -1521,6 +1639,44 @@ def fix_issue():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/fix-product", methods=["POST"])
+def fix_product():
+    """Creates one missing product in Odoo from its real current Shopify
+    data (see create_odoo_product_from_shopify). Shopify's REST API has no
+    way to look up a single product by variant SKU directly, so this pulls
+    the full catalog again and finds the match -- the same cost as loading
+    the Products tab itself, acceptable for a one-off manual click."""
+    if not check_any_dashboard_auth():
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(force=True, silent=True) or {}
+    sku = data.get("sku")
+    if not sku:
+        return jsonify({"error": "missing sku"}), 400
+
+    try:
+        existing = odoo("product.template", "search", [[("default_code", "=", sku)]], {"limit": 1})
+        if existing:
+            return jsonify({"status": "ok", "odoo_id": existing[0], "note": "already existed"})
+
+        token = shopify_access_token()
+        products = fetch_all_shopify_products(token)
+        match = None
+        for p in products:
+            for v in p.get("variants", []):
+                if (v.get("sku") or "").strip() == sku:
+                    match = (p, v)
+                    break
+            if match:
+                break
+        if not match:
+            return jsonify({"error": "SKU not found in Shopify"}), 404
+
+        new_id = create_odoo_product_from_shopify(*match)
+        return jsonify({"status": "ok", "odoo_id": new_id})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/dashboard", methods=["GET"])
 def dashboard():
     if not check_dashboard_auth():
@@ -1609,6 +1765,7 @@ def embedded_app():
 <div id="products-content" style="display:none">Loading...</div>
 </s-page>
 <script>{FILTER_JS}
+const ODOO_BASE_URL = {json.dumps(ODOO_URL)};
 let currentDays = 60;
 let productsLoaded = false;
 async function getAuthHeaders() {{
