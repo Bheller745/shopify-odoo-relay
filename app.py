@@ -1407,12 +1407,20 @@ def render_dashboard(rows, days):
     # Phase B (deferred): Refresh still does a full page reload here rather
     # than the AJAX fetch+replace used by the embedded /app -- only Dismiss/
     # Restore get the no-reload treatment for now, via the shared FILTER_JS.
+    # Products tab mirrors the embedded app's, fetched lazily on first click.
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <title>920D Shopify/Odoo Sync Status</title>
 <script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
 <style>{DASHBOARD_CSS}</style></head><body>
 <s-page heading="920D Shopify &harr; Odoo Sync Status">
+<div style="display:flex; gap:8px; margin-bottom:16px;">
+  <s-button variant="primary" id="tab-orders-btn">Orders</s-button>
+  <s-button variant="secondary" id="tab-products-btn">Products</s-button>
+</div>
+<div id="orders-content">
 {render_table_section(rows, days)}
+</div>
+<div id="products-content" style="display:none">Loading...</div>
 </s-page>
 <script>{FILTER_JS}
 async function getAuthHeaders() {{ return {{}}; }}
@@ -1421,6 +1429,28 @@ function refreshViaReload(days) {{
   if (days) url.searchParams.set('days', days);
   location.href = url.toString();
 }}
+let productsLoaded = false;
+async function loadProducts() {{
+  const el = document.getElementById('products-content');
+  el.innerHTML = 'Loading...';
+  const resp = await fetch('/dashboard/products-data', {{ headers: await getAuthHeaders() }});
+  if (!resp.ok) {{
+    el.innerHTML = '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
+    return;
+  }}
+  el.innerHTML = await resp.text();
+  wireProductFilters();
+  productsLoaded = true;
+}}
+function switchTab(tab) {{
+  document.getElementById('orders-content').style.display = (tab === 'orders') ? '' : 'none';
+  document.getElementById('products-content').style.display = (tab === 'products') ? '' : 'none';
+  document.getElementById('tab-orders-btn').setAttribute('variant', tab === 'orders' ? 'primary' : 'secondary');
+  document.getElementById('tab-products-btn').setAttribute('variant', tab === 'products' ? 'primary' : 'secondary');
+  if (tab === 'products' && !productsLoaded) loadProducts();
+}}
+document.getElementById('tab-orders-btn').addEventListener('click', function() {{ switchTab('orders'); }});
+document.getElementById('tab-products-btn').addEventListener('click', function() {{ switchTab('products'); }});
 wireAll(getAuthHeaders, refreshViaReload);
 </script>
 </body></html>"""
@@ -1503,6 +1533,19 @@ def dashboard():
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
     return Response(render_dashboard(rows, days), mimetype="text/html")
+
+
+@app.route("/dashboard/products-data", methods=["GET"])
+def dashboard_products_data():
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    try:
+        rows = audit_products()
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+    return Response(render_products_section(rows), mimetype="text/html")
 
 
 def _b64url_decode(s):
