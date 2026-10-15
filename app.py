@@ -1045,7 +1045,16 @@ def render_table_section(rows, days):
     dismissed_count = sum(1 for r in rows if r["dismissed"])
     clean = len(rows) - flagged - dismissed_count
     body_rows = []
-    for r in sorted(rows, key=lambda r: r["created_at"], reverse=True):
+    def sort_key(r):
+        # Flagged-but-not-dismissed rows first; within each group, newest
+        # order first -- these two need opposite directions, which a
+        # single reverse=True can't express on a tuple, hence the
+        # explicit date inversion instead.
+        flagged_first = 0 if (r["issues"] and not r["dismissed"]) else 1
+        date_num = int(r["created_at"].replace("-", "")) if r["created_at"] else 0
+        return (flagged_first, -date_num)
+
+    for r in sorted(rows, key=sort_key):
         display_issues = []
         for issue in r["issues"]:
             if issue.startswith("Unmatched SKU line(s): ") and r["unmatched_skus"]:
