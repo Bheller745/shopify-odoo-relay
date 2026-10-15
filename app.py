@@ -196,11 +196,16 @@ def create_odoo_product_from_shopify(product, variant):
     if variant_title and variant_title != "Default Title":
         title = f"{title} - {variant_title}"
 
+    # Sold on Shopify -> one of 920D's own manufactured finished goods, not
+    # a purchased part -- matches the catalog-wide convention (every
+    # manufactured item has "Can be Purchased" unchecked), and is what
+    # makes the missing-BOM check in audit_products() apply to it at all.
     vals = {
         "name": title,
         "default_code": variant.get("sku"),
         "is_storable": True,
         "sale_ok": True,
+        "purchase_ok": False,
         "list_price": float(variant.get("price") or 0.0),
     }
     if variant.get("barcode"):
@@ -946,16 +951,20 @@ def audit_products():
     for i in range(0, len(skus), CHUNK):
         chunk = skus[i:i + CHUNK]
         found = odoo("product.template", "search_read", [[("default_code", "in", chunk)]],
-                      {"fields": ["id", "default_code"]})
+                      {"fields": ["id", "default_code", "purchase_ok"]})
         for f in found:
-            odoo_by_sku[f["default_code"]] = f["id"]
+            odoo_by_sku[f["default_code"]] = f
 
-    # A Shopify-sold item with no BOM can't actually be built through a
+    # A manufactured item with no BOM can't actually be built through a
     # Manufacturing Order -- distinct from "missing from Odoo entirely"
     # (the product record exists, but nothing tells the floor how to make
-    # it). Batched the same way as the SKU match above, one query instead
-    # of one per product.
-    template_ids = list(odoo_by_sku.values())
+    # it). Only meaningful for things WE make, not purchased parts/
+    # components -- those are correctly purchase_ok=True (per the earlier
+    # catalog cleanup this whole project did: every manufactured item had
+    # "Can be Purchased" unchecked specifically so it wouldn't show up as
+    # purchasable), and were never supposed to have a BOM in the first
+    # place. Batched the same way as the SKU match above.
+    template_ids = [f["id"] for f in odoo_by_sku.values() if not f["purchase_ok"]]
     has_bom = set()
     for i in range(0, len(template_ids), CHUNK):
         chunk = template_ids[i:i + CHUNK]
@@ -966,7 +975,9 @@ def audit_products():
     rows = []
     for sku in skus:
         info = sku_info[sku]
-        odoo_id = odoo_by_sku.get(sku)
+        match = odoo_by_sku.get(sku)
+        odoo_id = match["id"] if match else None
+        is_manufactured = bool(match) and not match["purchase_ok"]
         rows.append({
             "sku": sku,
             "title": info["title"],
@@ -974,7 +985,7 @@ def audit_products():
             "status": info["status"],
             "shopify_product_id": info["shopify_product_id"],
             "odoo_id": odoo_id,
-            "missing_bom": bool(odoo_id) and odoo_id not in has_bom,
+            "missing_bom": is_manufactured and odoo_id not in has_bom,
         })
     return rows
 
