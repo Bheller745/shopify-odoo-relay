@@ -1045,7 +1045,7 @@ def render_table_section(rows, days):
     dismissed_count = sum(1 for r in rows if r["dismissed"])
     clean = len(rows) - flagged - dismissed_count
     body_rows = []
-    for r in sorted(rows, key=lambda r: (not (r["issues"] and not r["dismissed"]), r["name"])):
+    for r in sorted(rows, key=lambda r: r["created_at"], reverse=True):
         display_issues = []
         for issue in r["issues"]:
             if issue.startswith("Unmatched SKU line(s): ") and r["unmatched_skus"]:
