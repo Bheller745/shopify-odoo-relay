@@ -1576,9 +1576,13 @@ wireAll(getAuthHeaders, refreshViaReload);
 
 def check_dashboard_auth():
     auth = request.authorization
-    if not DASHBOARD_PASSWORD or not auth or not hmac.compare_digest(auth.password, DASHBOARD_PASSWORD):
+    # auth.password is None for non-Basic schemes (e.g. the embedded app's
+    # "Authorization: Bearer <token>") -- hmac.compare_digest throws on
+    # None instead of just failing the comparison, so that has to be
+    # checked explicitly before it ever reaches compare_digest.
+    if not DASHBOARD_PASSWORD or not auth or not auth.password:
         return False
-    return True
+    return hmac.compare_digest(auth.password, DASHBOARD_PASSWORD)
 
 
 def check_any_dashboard_auth():
