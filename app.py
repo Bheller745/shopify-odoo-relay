@@ -1125,7 +1125,15 @@ DASHBOARD_CSS = """
 .table-scroll { overflow-x: auto; width: 100%; }
 /* s-page defaults to a constrained, form-like reading width -- this is a
    data table, not a form, so it should use the full available width. */
-s-page { max-width: none !important; width: 100% !important; }
+/* s-page's internal padding/max-width can't be overridden (Shopify locks
+   it down by design, confirmed -- the !important override that used to
+   be here never actually took effect visually despite being present in
+   the markup) -- dropped it for a plain full-width wrapper + real <h1>
+   instead, keeping only the inner components (table/badges/buttons) as
+   Polaris elements. */
+body { margin: 0; padding: 16px 24px; box-sizing: border-box; }
+.page-wrap { width: 100%; }
+.page-wrap h1 { font-size: 20px; margin: 0 0 16px; }
 """
 
 FINANCIAL_BADGE = {
@@ -1636,7 +1644,8 @@ def render_dashboard(rows, days):
 <title>920D Shopify/Odoo Sync Status</title>
 <script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
 <style>{DASHBOARD_CSS}</style></head><body>
-<s-page heading="920D Shopify &harr; Odoo Sync Status">
+<div class="page-wrap">
+<h1>920D Shopify &harr; Odoo Sync Status</h1>
 <div style="display:flex; gap:8px; margin-bottom:16px;">
   <s-button variant="primary" id="tab-orders-btn">Orders</s-button>
   <s-button variant="secondary" id="tab-products-btn">Products</s-button>
@@ -1645,7 +1654,7 @@ def render_dashboard(rows, days):
 {render_table_section(rows, days)}
 </div>
 <div id="products-content" style="display:none">Loading...</div>
-</s-page>
+</div>
 <script>{FILTER_JS}
 const ODOO_BASE_URL = {json.dumps(ODOO_URL)};
 async function getAuthHeaders() {{ return {{}}; }}
@@ -1937,14 +1946,15 @@ def embedded_app():
 <script src="https://cdn.shopify.com/shopifycloud/app-bridge.js"></script>
 <script src="https://cdn.shopify.com/shopifycloud/polaris.js"></script>
 <style>{DASHBOARD_CSS}</style></head><body>
-<s-page heading="920D Shopify &harr; Odoo Sync Status">
+<div class="page-wrap">
+<h1>920D Shopify &harr; Odoo Sync Status</h1>
 <div style="display:flex; gap:8px; margin-bottom:16px;">
   <s-button variant="primary" id="tab-orders-btn">Orders</s-button>
   <s-button variant="secondary" id="tab-products-btn">Products</s-button>
 </div>
 <div id="orders-content">Loading...</div>
 <div id="products-content" style="display:none">Loading...</div>
-</s-page>
+</div>
 <script>{FILTER_JS}
 const ODOO_BASE_URL = {json.dumps(ODOO_URL)};
 let currentDays = 60;
