@@ -1189,6 +1189,10 @@ def render_table_section(rows, days):
                 if "Missing from Odoo entirely" in r["issues"]:
                     buttons.append(f'<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" '
                                     f'data-order="{r["name"]}">Create in Odoo</s-button>')
+                if any(i.startswith("Flagged in Odoo for delivery review") or
+                       i.startswith("Fulfilled in Shopify but not marked shipped") for i in r["issues"]):
+                    buttons.append(f'<s-button variant="primary" data-action="fix" data-fix-issue="delivery" '
+                                    f'data-order="{r["name"]}">Update Delivery</s-button>')
                 buttons.append(f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
                                 f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
                 action_html = '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + "".join(buttons) + '</div>'
@@ -1369,10 +1373,15 @@ function patchRowAfterToggle(order, wasDismiss) {
   if (actionCell) {
     const hash = actionCell.dataset.hash || '';
     const issueText = (row.querySelector('.issue-cell') || {}).textContent || '';
-    const needsFixButton = !wasDismiss && issueText.indexOf('Missing from Odoo entirely') !== -1;
-    const fixHtml = needsFixButton
-      ? '<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" data-order="' + order + '">Create in Odoo</s-button>'
-      : '';
+    let fixHtml = '';
+    if (!wasDismiss) {
+      if (issueText.indexOf('Missing from Odoo entirely') !== -1) {
+        fixHtml += '<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" data-order="' + order + '">Create in Odoo</s-button>';
+      }
+      if (issueText.indexOf('Flagged in Odoo for delivery review') !== -1 || issueText.indexOf('Fulfilled in Shopify but not marked shipped') !== -1) {
+        fixHtml += '<s-button variant="primary" data-action="fix" data-fix-issue="delivery" data-order="' + order + '">Update Delivery</s-button>';
+      }
+    }
     actionCell.innerHTML = wasDismiss
       ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
       : '<div style="display:flex;gap:6px;flex-wrap:wrap;">' + fixHtml +
@@ -1702,14 +1711,47 @@ def dismiss_issue():
     return jsonify({"status": "ok"})
 
 
+def update_delivery_for_order(order_name):
+    """Validates the order's real delivery in Odoo -- the exact same
+    write-quantity-then-button_validate pattern used throughout this
+    session's manual cleanups (920-36376 and the 78 orders fixed after
+    it), now available as a one-click action instead of a script.
+
+    Deliberately refuses to touch anything if the linked Manufacturing
+    Order isn't done yet, rather than force-completing it -- that's a real
+    claim about physical production having happened, not something a
+    button should assert on its own. The earlier bulk cleanups that DID
+    force-complete MOs were explicit, supervised, one-time decisions, not
+    a behavior this always-available button should repeat silently."""
+    order_id = find_existing_order(order_name)
+    if not order_id:
+        raise ValueError("order not found in Odoo")
+
+    mos = odoo("mrp.production", "search_read",
+               [[("origin", "=", f"Shopify backorder: {order_name}")]], {"fields": ["state"]})
+    if mos and not all(m["state"] == "done" for m in mos):
+        raise ValueError("Linked Manufacturing Order isn't marked Done yet -- build it first")
+
+    pickings = odoo("stock.picking", "search_read",
+                     [[("sale_id", "=", order_id), ("state", "not in", ("done", "cancel"))]],
+                     {"fields": ["id", "move_ids"]})
+    for p in pickings:
+        moves = odoo("stock.move", "read", [p["move_ids"]], {"fields": ["id", "product_uom_qty"]})
+        for m in moves:
+            odoo("stock.move", "write", [[m["id"]], {"quantity": m["product_uom_qty"]}])
+        odoo("stock.picking", "button_validate", [[p["id"]]])
+
+    odoo("sale.order", "write", [[order_id], {"x_delivery_review_needed": False, "locked": True}])
+
+
 @app.route("/fix", methods=["POST"])
 def fix_issue():
     """Applies a real fix for one specific issue type, reusing the exact
     same logic the live webhook uses rather than a simplified duplicate.
-    Currently only "missing_from_odoo" is implemented (create the order in
-    Odoo from Shopify's real current data) -- other issue types don't have
-    a safe one-click fix (e.g. a refund mismatch needs a human to look at
-    WHY before any action is taken)."""
+    Handles "missing_from_odoo" (create the order from Shopify's real
+    current data) and "delivery" (validate the real delivery) -- other
+    issue types don't have a safe one-click fix (e.g. a refund mismatch
+    needs a human to look at WHY before any action is taken)."""
     if not check_any_dashboard_auth():
         return jsonify({"error": "unauthorized"}), 401
     data = request.get_json(force=True, silent=True) or {}
@@ -1718,16 +1760,19 @@ def fix_issue():
     if not order_name:
         return jsonify({"error": "missing order"}), 400
 
-    if issue_type != "missing_from_odoo":
-        return jsonify({"error": f"no automatic fix available for issue type: {issue_type}"}), 400
-
     try:
-        token = shopify_access_token()
-        payload = fetch_shopify_order_by_name(token, order_name)
-        if not payload:
-            return jsonify({"error": "order not found in Shopify"}), 404
-        new_id = sync_order_from_payload(payload)
-        return jsonify({"status": "ok", "odoo_id": new_id})
+        if issue_type == "missing_from_odoo":
+            token = shopify_access_token()
+            payload = fetch_shopify_order_by_name(token, order_name)
+            if not payload:
+                return jsonify({"error": "order not found in Shopify"}), 404
+            new_id = sync_order_from_payload(payload)
+            return jsonify({"status": "ok", "odoo_id": new_id})
+        elif issue_type == "delivery":
+            update_delivery_for_order(order_name)
+            return jsonify({"status": "ok"})
+        else:
+            return jsonify({"error": f"no automatic fix available for issue type: {issue_type}"}), 400
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
