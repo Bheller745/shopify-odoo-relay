@@ -1131,9 +1131,12 @@ DASHBOARD_CSS = """
    the markup) -- dropped it for a plain full-width wrapper + real <h1>
    instead, keeping only the inner components (table/badges/buttons) as
    Polaris elements. */
-body { margin: 0; padding: 16px 24px; box-sizing: border-box; }
+body {
+  margin: 0; padding: 16px 24px; box-sizing: border-box; color: #1a1a1a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
 .page-wrap { width: 100%; }
-.page-wrap h1 { font-size: 20px; margin: 0 0 16px; }
+.page-wrap h1 { font-size: 20px; font-weight: 650; margin: 0 0 16px; letter-spacing: -.01em; }
 """
 
 FINANCIAL_BADGE = {
