@@ -1513,11 +1513,6 @@ async function fixProductAction(btn) {
   btn.disabled = true;
   const originalText = btn.textContent;
   btn.textContent = 'Working...';
-  // Opened synchronously, right in the click handler, and redirected once
-  // the real product id is known -- popup blockers allow window.open()
-  // during a direct user gesture, but block it if called after the
-  // fetch's await (by then the gesture context has expired).
-  const resultWindow = window.open('about:blank', '_blank');
   try {
     const headers = Object.assign({'Content-Type': 'application/json'}, await window.__dashAuthHeaders());
     const resp = await fetch('/fix-product', {
@@ -1530,11 +1525,20 @@ async function fixProductAction(btn) {
       showProductActionError(sku, 'Fix failed (' + resp.status + '): ' + (result.error || resp.statusText));
       btn.disabled = false;
       btn.textContent = originalText;
-      if (resultWindow) resultWindow.close();
       return;
     }
     const odooUrl = ODOO_BASE_URL + '/web#model=product.template&view_type=form&id=' + result.odoo_id;
-    if (resultWindow) resultWindow.location.href = odooUrl;
+    // window.open()-then-redirect doesn't survive Shopify's embedded
+    // iframe (silently inert there) -- a real anchor click does, since
+    // the table's own target="_blank" links already work fine in this
+    // same context, so this reuses that exact mechanism instead.
+    const link = document.createElement('a');
+    link.href = odooUrl;
+    link.target = '_blank';
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
     const row = document.querySelector('#products-table-body s-table-row[data-sku="' + sku + '"]');
     if (row) {
       // A freshly created product has no BOM yet -- "missing_bom", not
@@ -1555,7 +1559,6 @@ async function fixProductAction(btn) {
     showProductActionError(sku, 'Error: ' + err.message);
     btn.disabled = false;
     btn.textContent = originalText;
-    if (resultWindow) resultWindow.close();
   }
 }
 
