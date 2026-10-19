@@ -1537,6 +1537,16 @@ async function fixSkuAction(btn) {
       btn.textContent = originalText;
       return;
     }
+    if (result.odoo_id) {
+      const odooUrl = ODOO_BASE_URL + '/web#model=product.template&view_type=form&id=' + result.odoo_id;
+      const link = document.createElement('a');
+      link.href = odooUrl;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    }
     // The order's row can change in several ways (line attached or not,
     // issue list shrinking) -- same reasoning as fixAction above, a full
     // refetch is the only way to reflect that accurately.
