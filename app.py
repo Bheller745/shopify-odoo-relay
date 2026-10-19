@@ -1123,6 +1123,31 @@ DASHBOARD_CSS = """
    just the table instead of letting content silently clip off-screen
    with no way to reach it. */
 .table-scroll { overflow-x: auto; width: 100%; }
+/* Shopify's real tab style: underline indicator, not solid filled
+   buttons -- s-button can't be restyled this way (locked internals), so
+   these are plain buttons instead. */
+.tabs { display: flex; gap: 24px; border-bottom: 1px solid #e3e3e3; margin-bottom: 20px; }
+.tab-btn {
+  background: none; border: none; padding: 10px 2px; margin-bottom: -1px; cursor: pointer;
+  font-family: inherit; font-size: 14px; font-weight: 500; color: #6d7175;
+  border-bottom: 3px solid transparent;
+}
+.tab-btn.active { color: #1a1a1a; font-weight: 650; border-bottom-color: #1a1a1a; }
+.tab-btn:hover { color: #1a1a1a; }
+/* Consolidates each row's buttons behind a single "..." trigger instead
+   of stacking them inline -- the single biggest thing making the table
+   feel like a raw spreadsheet rather than a real Shopify list. */
+.action-menu { position: relative; }
+.action-menu summary { list-style: none; cursor: pointer; width: 28px; height: 28px; border-radius: 6px;
+  border: 1px solid #c9cccf; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #4a4a4a; }
+.action-menu summary::-webkit-details-marker { display: none; }
+.action-menu summary:hover { background: #f1f1f1; }
+.action-menu[open] summary { background: #e4e5e7; }
+.action-menu-content {
+  position: absolute; right: 0; top: 32px; z-index: 20; background: #fff; border: 1px solid #e3e3e3;
+  border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,.12); padding: 8px; display: flex;
+  flex-direction: column; gap: 6px; min-width: 160px;
+}
 /* s-page defaults to a constrained, form-like reading width -- this is a
    data table, not a form, so it should use the full available width. */
 /* s-page's internal padding/max-width can't be overridden (Shopify locks
@@ -1199,7 +1224,7 @@ def render_table_section(rows, days):
         action_html = "-"
         if r["issues"]:
             if r["dismissed"]:
-                action_html = f'<s-button variant="secondary" data-action="restore" data-order="{r["name"]}">Restore</s-button>'
+                buttons = [f'<s-button variant="secondary" data-action="restore" data-order="{r["name"]}">Restore</s-button>']
             else:
                 buttons = []
                 if "Missing from Odoo entirely" in r["issues"]:
@@ -1211,7 +1236,8 @@ def render_table_section(rows, days):
                                     f'data-order="{r["name"]}">Update Delivery</s-button>')
                 buttons.append(f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
                                 f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
-                action_html = '<div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start;">' + "".join(buttons) + '</div>'
+            action_html = ('<details class="action-menu"><summary>&ctdot;</summary>'
+                            '<div class="action-menu-content">' + "".join(buttons) + '</div></details>')
         search_blob = " ".join([r["name"], r["customer_name"] or "", r["email"] or ""]).lower()
         if r["dismissed"]:
             bar_color = "#8c9196"
@@ -1402,10 +1428,11 @@ function patchRowAfterToggle(order, wasDismiss) {
         fixHtml += '<s-button variant="primary" data-action="fix" data-fix-issue="delivery" data-order="' + order + '">Update Delivery</s-button>';
       }
     }
-    actionCell.innerHTML = wasDismiss
+    const menuButtons = wasDismiss
       ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
-      : '<div style="display:flex;flex-direction:column;gap:6px;align-items:flex-start;">' + fixHtml +
-        '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button></div>';
+      : fixHtml + '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button>';
+    actionCell.innerHTML = '<details class="action-menu"><summary>&ctdot;</summary>' +
+      '<div class="action-menu-content">' + menuButtons + '</div></details>';
     actionCell.querySelectorAll('s-button[data-action="dismiss"], s-button[data-action="restore"]').forEach(wireActionButton);
     actionCell.querySelectorAll('s-button[data-action="fix"]').forEach(wireFixButton);
   }
@@ -1533,10 +1560,21 @@ function wireActions(getAuthHeaders) {
   document.querySelectorAll('[data-action="fix-sku"]').forEach(wireSkuFixButton);
 }
 
+function wireActionMenuAutoClose() {
+  if (window.__actionMenuCloseWired) return;
+  window.__actionMenuCloseWired = true;
+  document.addEventListener('click', function(e) {
+    document.querySelectorAll('.action-menu[open]').forEach(function(menu) {
+      if (!menu.contains(e.target)) menu.removeAttribute('open');
+    });
+  });
+}
+
 function wireAll(getAuthHeaders, refreshFn) {
   window.__dashRefresh = function() { refreshFn(); };
   wireFilters();
   wireActions(getAuthHeaders);
+  wireActionMenuAutoClose();
   const refreshBtn = document.getElementById('refresh-btn');
   if (refreshBtn) {
     refreshBtn.addEventListener('click', function() {
@@ -1649,9 +1687,9 @@ def render_dashboard(rows, days):
 <style>{DASHBOARD_CSS}</style></head><body>
 <div class="page-wrap">
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
-<div style="display:flex; gap:8px; margin-bottom:16px;">
-  <s-button variant="primary" id="tab-orders-btn">Orders</s-button>
-  <s-button variant="secondary" id="tab-products-btn">Products</s-button>
+<div class="tabs">
+  <button class="tab-btn active" id="tab-orders-btn">Orders</button>
+  <button class="tab-btn" id="tab-products-btn">Products</button>
 </div>
 <div id="orders-content">
 {render_table_section(rows, days)}
@@ -1690,8 +1728,8 @@ async function loadProducts() {{
 function switchTab(tab) {{
   document.getElementById('orders-content').style.display = (tab === 'orders') ? '' : 'none';
   document.getElementById('products-content').style.display = (tab === 'products') ? '' : 'none';
-  document.getElementById('tab-orders-btn').setAttribute('variant', tab === 'orders' ? 'primary' : 'secondary');
-  document.getElementById('tab-products-btn').setAttribute('variant', tab === 'products' ? 'primary' : 'secondary');
+  document.getElementById('tab-orders-btn').classList.toggle('active', tab === 'orders');
+  document.getElementById('tab-products-btn').classList.toggle('active', tab === 'products');
   if (tab === 'products' && !productsLoaded) loadProducts();
 }}
 document.getElementById('tab-orders-btn').addEventListener('click', function() {{ switchTab('orders'); }});
@@ -1959,9 +1997,9 @@ def embedded_app():
 <style>{DASHBOARD_CSS}</style></head><body>
 <div class="page-wrap">
 <h1>920D Shopify &harr; Odoo Sync Status</h1>
-<div style="display:flex; gap:8px; margin-bottom:16px;">
-  <s-button variant="primary" id="tab-orders-btn">Orders</s-button>
-  <s-button variant="secondary" id="tab-products-btn">Products</s-button>
+<div class="tabs">
+  <button class="tab-btn active" id="tab-orders-btn">Orders</button>
+  <button class="tab-btn" id="tab-products-btn">Products</button>
 </div>
 <div id="orders-content">Loading...</div>
 <div id="products-content" style="display:none">Loading...</div>
@@ -2003,8 +2041,8 @@ function switchTab(tab) {{
   const productsBtn = document.getElementById('tab-products-btn');
   document.getElementById('orders-content').style.display = (tab === 'orders') ? '' : 'none';
   document.getElementById('products-content').style.display = (tab === 'products') ? '' : 'none';
-  ordersBtn.setAttribute('variant', tab === 'orders' ? 'primary' : 'secondary');
-  productsBtn.setAttribute('variant', tab === 'products' ? 'primary' : 'secondary');
+  ordersBtn.classList.toggle('active', tab === 'orders');
+  productsBtn.classList.toggle('active', tab === 'products');
   if (tab === 'products' && !productsLoaded) loadProducts();
 }}
 document.getElementById('tab-orders-btn').addEventListener('click', function() {{ switchTab('orders'); }});
