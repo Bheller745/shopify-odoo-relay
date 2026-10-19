@@ -1192,13 +1192,19 @@ def render_table_section(rows, days):
     clean = len(rows) - flagged - dismissed_count
     body_rows = []
     def sort_key(r):
-        # Flagged-but-not-dismissed rows first; within each group, newest
-        # order first -- these two need opposite directions, which a
-        # single reverse=True can't express on a tuple, hence the
-        # explicit date inversion instead.
-        flagged_first = 0 if (r["issues"] and not r["dismissed"]) else 1
+        # Three tiers: flagged-but-not-dismissed first, clean in the
+        # middle, dismissed at the very bottom (out of the way once
+        # reviewed) -- newest-first within each tier. Mixed tier/date
+        # directions can't be expressed with a single reverse=True on a
+        # tuple, hence the explicit date inversion.
+        if r["issues"] and not r["dismissed"]:
+            tier = 0
+        elif r["dismissed"]:
+            tier = 2
+        else:
+            tier = 1
         date_num = int(r["created_at"].replace("-", "")) if r["created_at"] else 0
-        return (flagged_first, -date_num)
+        return (tier, -date_num)
 
     for r in sorted(rows, key=sort_key):
         display_issues = []
