@@ -1207,7 +1207,7 @@ def render_table_section(rows, days):
                 sku_bits = ", ".join(
                     f'<a href="{shopify_product_search_url(sku)}" target="_blank" rel="noopener">{sku}</a> '
                     f'<span class="action-cell" data-sku="{sku}">'
-                    f'<s-button variant="primary" data-action="fix-sku" data-sku="{sku}" data-order="{r["name"]}">Create SKU</s-button></span>'
+                    f'<s-button type="button" variant="primary" data-action="fix-sku" data-sku="{sku}" data-order="{r["name"]}">Create SKU</s-button></span>'
                     for sku in r["unmatched_skus"]
                 )
                 display_issues.append(f"Unmatched SKU line(s): {sku_bits}")
@@ -1224,17 +1224,17 @@ def render_table_section(rows, days):
         action_html = "-"
         if r["issues"]:
             if r["dismissed"]:
-                buttons = [f'<s-button variant="secondary" data-action="restore" data-order="{r["name"]}">Restore</s-button>']
+                buttons = [f'<s-button type="button" variant="secondary" data-action="restore" data-order="{r["name"]}">Restore</s-button>']
             else:
                 buttons = []
                 if "Missing from Odoo entirely" in r["issues"]:
-                    buttons.append(f'<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" '
+                    buttons.append(f'<s-button type="button" variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" '
                                     f'data-order="{r["name"]}">Create in Odoo</s-button>')
                 if any(i.startswith("Flagged in Odoo for delivery review") or
                        i.startswith("Fulfilled in Shopify but not marked shipped") for i in r["issues"]):
-                    buttons.append(f'<s-button variant="primary" data-action="fix" data-fix-issue="delivery" '
+                    buttons.append(f'<s-button type="button" variant="primary" data-action="fix" data-fix-issue="delivery" '
                                     f'data-order="{r["name"]}">Update Delivery</s-button>')
-                buttons.append(f'<s-button variant="secondary" tone="critical" data-action="dismiss" '
+                buttons.append(f'<s-button type="button" variant="secondary" tone="critical" data-action="dismiss" '
                                 f'data-order="{r["name"]}" data-hash="{hash_val}">Dismiss</s-button>')
             action_html = ('<details class="action-menu"><summary>&ctdot;</summary>'
                             '<div class="action-menu-content">' + "".join(buttons) + '</div></details>')
@@ -1275,7 +1275,7 @@ def render_table_section(rows, days):
 <div class="filter-toolbar">
   <span class="muted">Days back</span>
   <input type="number" id="f-days" value="{days}" style="width:70px">
-  <s-button variant="primary" id="refresh-btn">Refresh</s-button>
+  <s-button type="button" variant="primary" id="refresh-btn">Refresh</s-button>
   <input type="text" id="f-search" placeholder="Search order #, customer, email...">
   <select id="f-flag"><option value="">All rows</option><option value="1">Flagged only</option><option value="0">Clean only</option></select>
   <select id="f-financial"><option value="">Any payment status</option><option value="paid">Paid</option><option value="partially_paid">Partially paid</option><option value="pending">Pending</option><option value="refunded">Refunded</option><option value="partially_refunded">Partially refunded</option><option value="voided">Voided</option></select>
@@ -1312,7 +1312,7 @@ def render_products_section(rows):
             odoo_cell = "-"
             status_badge = '<s-badge tone="critical">Missing from Odoo</s-badge>'
             action_html = (f'<span class="action-cell" data-sku="{r["sku"]}">'
-                            f'<s-button variant="primary" data-action="fix-product" data-sku="{r["sku"]}">Create in Odoo</s-button></span>')
+                            f'<s-button type="button" variant="primary" data-action="fix-product" data-sku="{r["sku"]}">Create in Odoo</s-button></span>')
         elif r["missing_bom"]:
             bar_color = "#b98900"
             status = "missing_bom"
@@ -1422,15 +1422,15 @@ function patchRowAfterToggle(order, wasDismiss) {
     let fixHtml = '';
     if (!wasDismiss) {
       if (issueText.indexOf('Missing from Odoo entirely') !== -1) {
-        fixHtml += '<s-button variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" data-order="' + order + '">Create in Odoo</s-button>';
+        fixHtml += '<s-button type="button" variant="primary" data-action="fix" data-fix-issue="missing_from_odoo" data-order="' + order + '">Create in Odoo</s-button>';
       }
       if (issueText.indexOf('Flagged in Odoo for delivery review') !== -1 || issueText.indexOf('Fulfilled in Shopify but not marked shipped') !== -1) {
-        fixHtml += '<s-button variant="primary" data-action="fix" data-fix-issue="delivery" data-order="' + order + '">Update Delivery</s-button>';
+        fixHtml += '<s-button type="button" variant="primary" data-action="fix" data-fix-issue="delivery" data-order="' + order + '">Update Delivery</s-button>';
       }
     }
     const menuButtons = wasDismiss
-      ? '<s-button variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
-      : fixHtml + '<s-button variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button>';
+      ? '<s-button type="button" variant="secondary" data-action="restore" data-order="' + order + '">Restore</s-button>'
+      : fixHtml + '<s-button type="button" variant="secondary" tone="critical" data-action="dismiss" data-order="' + order + '" data-hash="' + hash + '">Dismiss</s-button>';
     actionCell.innerHTML = '<details class="action-menu"><summary>&ctdot;</summary>' +
       '<div class="action-menu-content">' + menuButtons + '</div></details>';
     actionCell.querySelectorAll('s-button[data-action="dismiss"], s-button[data-action="restore"]').forEach(wireActionButton);
