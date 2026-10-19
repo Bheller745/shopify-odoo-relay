@@ -999,6 +999,18 @@ def odoo_order_url(odoo_id):
     return f"{ODOO_URL}/web#model=sale.order&view_type=form&id={odoo_id}"
 
 
+def odoo_mo_list_url(order_name):
+    """Links to the MO list filtered by this order's real backorder origin
+    string, rather than a specific MO id -- works uniformly whether there
+    are zero (shows empty, which is itself informative), one, or several
+    MOs for the order (a line per product, or a batch split past
+    BACKORDER_MO_CAP), without needing an extra Odoo query just to find
+    out which case applies."""
+    origin = f"Shopify backorder: {order_name}"
+    domain = json.dumps([["origin", "=", origin]])
+    return f"{ODOO_URL}/web#model=mrp.production&view_type=list&domain={urllib.parse.quote(domain)}"
+
+
 def shopify_product_search_url(sku):
     """Links an unmatched SKU to Shopify's own product search -- there's
     nothing to link to in Odoo for these (the product doesn't exist there
@@ -1226,6 +1238,7 @@ def render_table_section(rows, days):
         links = [f'<a href="{shopify_order_url(r["shopify_id"])}" target="_blank" rel="noopener">Shopify</a>']
         if r["odoo_id"]:
             links.append(f'<a href="{odoo_order_url(r["odoo_id"])}" target="_blank" rel="noopener">Odoo</a>')
+            links.append(f'<a href="{odoo_mo_list_url(r["name"])}" target="_blank" rel="noopener">MO</a>')
         hash_val = r["issue_hash"] or ""
         action_html = "-"
         if r["issues"]:
