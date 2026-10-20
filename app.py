@@ -884,7 +884,13 @@ def fetch_recent_shopify_orders(token, days):
     cursor-based pagination requires following that exact URL rather than
     constructing subsequent pages manually (page_info tokens aren't
     reusable across different query params)."""
-    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    requested_since = datetime.now(timezone.utc) - timedelta(days=days)
+    # The new database starts with zero orders by design -- every order
+    # before the cutover will always show as "missing from Odoo" and is
+    # pure noise until that date actually arrives, so the audit window
+    # never reaches earlier than the cutover regardless of "days back".
+    since_dt = max(requested_since, ORDERS_PAUSED_UNTIL)
+    since = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     url = (f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/orders.json"
            f"?status=any&limit=250&created_at_min={urllib.parse.quote(since)}")
     orders = []
