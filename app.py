@@ -435,10 +435,11 @@ def create_backorder_mos(order_id, order_ref):
             odoo("mrp.production", "create", [{
                 "product_id": product_id,
                 "product_qty": batch_qty,
-                # Odoo Online (saas~19.4) uses "uom_id" here -- a documented
-                # field-name drift from other Odoo versions that use
-                # "product_uom_id" for the same concept.
-                "uom_id": product["uom_id"][0],
+                # the920d-custom (19.0 stable) uses "product_uom_id" here --
+                # the old 920d-custom.odoo.com (saas~19.4) used "uom_id" for
+                # the same concept; same drift already documented/fixed for
+                # mrp.bom.line in import_catalog_snapshot.py.
+                "product_uom_id": product["uom_id"][0],
                 "origin": origin,
                 "sale_line_id": line["id"],
                 # Native "Sale" smart button on the MO reads sale_line_id
