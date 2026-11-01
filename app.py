@@ -460,7 +460,7 @@ _SHOPIFY_BANK_ACCOUNT_ID = None
 def _misc_journal_id():
     global _MISC_JOURNAL_ID
     if _MISC_JOURNAL_ID is None:
-        _MISC_JOURNAL_ID = odoo("account.journal", "search", [[("code", "=", "MISC")]], {"limit": 1})[0]
+        _MISC_JOURNAL_ID = odoo("account.journal", "search", [[("code", "=", "SHOP")]], {"limit": 1})[0]
     return _MISC_JOURNAL_ID
 
 
