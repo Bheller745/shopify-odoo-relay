@@ -826,6 +826,31 @@ def shopify_webhook():
     topic = request.headers.get("X-Shopify-Topic", "")
     payload = json.loads(raw_body)
 
+    # The check above only guards the pause *window* by wall-clock time, so
+    # once the cutover date arrives it opens for ALL webhooks -- including
+    # orders/updated firing today for an order that was actually placed
+    # before cutover (e.g. a late fulfillment edit, a tag change, a refund
+    # touch). Those pre-cutover orders were never meant to be CREATED in
+    # Odoo via live sync -- but one that's already in Odoo (created during
+    # the brief post-cutover leak, or legitimately pre-existing) still
+    # needs to receive real updates (fulfillment, refunds, cancellations),
+    # so this only blocks the create path, never updates to an order that
+    # already exists. Payloads without a created_at (e.g. returns/*,
+    # handled separately below) skip this check and fall through unaffected.
+    order_created_at = payload.get("created_at")
+    if order_created_at:
+        try:
+            order_created_dt = datetime.fromisoformat(order_created_at)
+        except ValueError:
+            order_created_dt = None
+        if order_created_dt and order_created_dt < ORDERS_PAUSED_UNTIL:
+            pre_cutover_order_ref = payload.get("name") or str(payload.get("id"))
+            if not find_existing_order(pre_cutover_order_ref):
+                return jsonify({
+                    "status": "skipped",
+                    "reason": "order predates cutover and isn't in Odoo yet, not live-created",
+                }), 200
+
     # Returns are a separate Shopify resource, not an Order payload -- their
     # JSON only carries the numeric order_id (never the order name/number),
     # so this is handled entirely separately from the order-sync logic
