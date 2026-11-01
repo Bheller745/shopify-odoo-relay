@@ -454,6 +454,7 @@ def create_backorder_mos(order_id, order_ref):
 
 
 _MISC_JOURNAL_ID = None
+_SALES_JOURNAL_ID = None
 _SHOPIFY_BANK_ACCOUNT_ID = None
 
 
@@ -462,6 +463,13 @@ def _misc_journal_id():
     if _MISC_JOURNAL_ID is None:
         _MISC_JOURNAL_ID = odoo("account.journal", "search", [[("code", "=", "SHOP")]], {"limit": 1})[0]
     return _MISC_JOURNAL_ID
+
+
+def _sales_journal_id():
+    global _SALES_JOURNAL_ID
+    if _SALES_JOURNAL_ID is None:
+        _SALES_JOURNAL_ID = odoo("account.journal", "search", [[("code", "=", "SALE")]], {"limit": 1})[0]
+    return _SALES_JOURNAL_ID
 
 
 def _shopify_bank_account_id():
@@ -499,6 +507,14 @@ def auto_invoice_and_pay(order_id, order_ref):
         {"fields": ["id"]})
     for inv in invoices:
         inv_id = inv["id"]
+        # Default invoice numbering continues the "920-XXXXX" sequence that
+        # pre-dates this migration, which is confusingly similar to
+        # Shopify's own order-number format (also "920-XXXXX", coincidence
+        # of branding, not the same counter). Force these onto the
+        # dedicated "Sales" (SALE) journal instead, which has no entangled
+        # history and numbers cleanly as SALE/2026/00001 -- distinct at a
+        # glance from any Shopify order number.
+        odoo("account.move", "write", [[inv_id], {"journal_id": _sales_journal_id()}])
         odoo("account.move", "action_post", [[inv_id]])
         ar_lines = odoo("account.move.line", "search_read",
             [[("move_id", "=", inv_id), ("account_id.account_type", "=", "asset_receivable")]],
@@ -557,6 +573,7 @@ def process_refund(order_id, order_ref, refund_amount):
         "partner_id": inv["partner_id"][0],
         "invoice_origin": order_ref,
         "ref": f"Shopify refund for {order_ref}",
+        "journal_id": _sales_journal_id(),
         "invoice_line_ids": [(0, 0, {
             "name": f"Shopify refund for {order_ref}",
             "quantity": 1,
