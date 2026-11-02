@@ -530,6 +530,20 @@ def auto_invoice_and_pay(order_id, order_ref):
     settlement-move-and-reconcile approach is the one proven to actually
     zero out the residual, throughout this whole migration project.
     """
+    # Guard against ever creating a second invoice for the same order --
+    # x_invoice_checked is meant to prevent a re-call (webhook retry, or the
+    # dashboard's manual "Fix" button firing twice), but it's set in a
+    # separate write AFTER this function returns, so a crash/retry between
+    # "invoice created" and "flag saved" would otherwise re-run this whole
+    # function and produce a second, split invoice for the same order (this
+    # happened for real with the shipping-line backfill on 920-36537/38/39,
+    # cleaned up by hand -- this check is what stops it happening again,
+    # for any future cause, not just that specific one).
+    existing_invoice = odoo("account.move", "search",
+        [[("invoice_origin", "=", order_ref), ("move_type", "=", "out_invoice"), ("state", "!=", "cancel")]], {"limit": 1})
+    if existing_invoice:
+        return
+
     wiz_ctx = {"active_model": "sale.order", "active_ids": [order_id], "active_id": order_id}
     wiz_id = odoo("sale.advance.payment.inv", "create", [{"advance_payment_method": "delivered"}], {"context": wiz_ctx})
     odoo_safe("sale.advance.payment.inv", "create_invoices", [[wiz_id]], {"context": wiz_ctx})
