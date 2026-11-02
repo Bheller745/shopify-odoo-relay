@@ -278,7 +278,12 @@ def build_order_lines(shopify_order, new_products):
     # which would show up as a permanent gap when reconciling against the
     # real bank payout. Summed rather than one line per shipping_lines
     # entry since Shopify can rarely split shipping across >1 line.
-    shipping_total = sum(float(sl.get("price") or 0.0) for sl in shopify_order.get("shipping_lines", []))
+    # Uses discounted_price (what the customer actually paid), not price
+    # (the undiscounted list rate) -- a free-shipping/discounted-shipping
+    # promo would otherwise overcharge this line relative to what Shopify
+    # really collected, same principle as line_discount_percent() above
+    # for product lines.
+    shipping_total = sum(float(sl.get("discounted_price") or sl.get("price") or 0.0) for sl in shopify_order.get("shipping_lines", []))
     if shipping_total > 0.01:
         shipping_product_id = _shipping_product_id()
         line_vals = {
