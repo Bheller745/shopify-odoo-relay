@@ -232,6 +232,17 @@ def create_odoo_product_from_shopify(product, variant):
     return new_id
 
 
+_SHIPPING_PRODUCT_ID = None
+
+
+def _shipping_product_id():
+    global _SHIPPING_PRODUCT_ID
+    if _SHIPPING_PRODUCT_ID is None:
+        found = odoo("product.product", "search", [[("name", "=", "Shipping")]], {"limit": 1})
+        _SHIPPING_PRODUCT_ID = found[0] if found else None
+    return _SHIPPING_PRODUCT_ID
+
+
 def build_order_lines(shopify_order, new_products):
     """new_products is a list the caller passes in and this appends to --
     any SKU that had to be auto-created gets recorded there so the caller
@@ -259,6 +270,27 @@ def build_order_lines(shopify_order, new_products):
         if product_id:
             line_vals["product_id"] = product_id
         lines.append((0, 0, line_vals))
+
+    # Shipping is money the customer actually paid Shopify, same as any
+    # other line -- without this, the sale order (and everything downstream:
+    # the invoice, and the amount booked into the "920D Shopify" clearing
+    # account) undercounts the real order total by the shipping charge,
+    # which would show up as a permanent gap when reconciling against the
+    # real bank payout. Summed rather than one line per shipping_lines
+    # entry since Shopify can rarely split shipping across >1 line.
+    shipping_total = sum(float(sl.get("price") or 0.0) for sl in shopify_order.get("shipping_lines", []))
+    if shipping_total > 0.01:
+        shipping_product_id = _shipping_product_id()
+        line_vals = {
+            "name": "Shipping",
+            "product_uom_qty": 1,
+            "price_unit": shipping_total,
+            "tax_ids": [(6, 0, [])],
+        }
+        if shipping_product_id:
+            line_vals["product_id"] = shipping_product_id
+        lines.append((0, 0, line_vals))
+
     return lines
 
 
