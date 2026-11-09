@@ -790,7 +790,14 @@ def sync_order_from_payload(payload):
     financial_status = payload.get("financial_status")
     if financial_status in ("paid", "partially_paid") or payload.get("confirmed"):
         try:
-            odoo("sale.order", "action_confirm", [[new_id]])
+            # skip_procurement: these products now carry the native MTO
+            # route (added for manually-created orders so Odoo auto-links
+            # an MO on confirm). Without this flag, action_confirm would
+            # ALSO fire Odoo's own MTO procurement here, creating a second,
+            # wrongly-shaped MO (auto-confirmed, no batching, no
+            # x_sale_order_id) alongside the one create_backorder_mos()
+            # builds below -- real duplicate builds on the floor.
+            odoo("sale.order", "action_confirm", [[new_id]], {"context": {"skip_procurement": True}})
         except Exception:
             pass  # already confirmed or not confirmable yet -- not fatal
 
