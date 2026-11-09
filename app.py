@@ -579,9 +579,9 @@ def auto_invoice_and_pay(order_id, order_ref):
             "journal_id": _misc_journal_id(),
             "ref": f"Shopify auto-pay for {order_ref}",
             "line_ids": [
-                (0, 0, {"account_id": _shopify_bank_account_id(), "name": "Shopify auto-payment", "debit": amt, "credit": 0.0}),
+                (0, 0, {"account_id": _shopify_bank_account_id(), "name": f"Shopify auto-payment - {order_ref}", "debit": amt, "credit": 0.0}),
                 (0, 0, {"account_id": ar_lines[0]["account_id"][0], "partner_id": ar_lines[0]["partner_id"][0] if ar_lines[0]["partner_id"] else False,
-                        "name": "Shopify auto-payment", "debit": 0.0, "credit": amt}),
+                        "name": f"Shopify auto-payment - {order_ref}", "debit": 0.0, "credit": amt}),
             ],
         }])
         odoo("account.move", "action_post", [[settle_id]])
@@ -645,8 +645,8 @@ def process_refund(order_id, order_ref, refund_amount):
         "ref": f"Shopify refund settlement for {order_ref}",
         "line_ids": [
             (0, 0, {"account_id": cn_ar[0]["account_id"][0], "partner_id": inv["partner_id"][0],
-                    "name": "Shopify refund", "debit": refund_amount, "credit": 0.0}),
-            (0, 0, {"account_id": _shopify_bank_account_id(), "name": "Shopify refund", "debit": 0.0, "credit": refund_amount}),
+                    "name": f"Shopify refund - {order_ref}", "debit": refund_amount, "credit": 0.0}),
+            (0, 0, {"account_id": _shopify_bank_account_id(), "name": f"Shopify refund - {order_ref}", "debit": 0.0, "credit": refund_amount}),
         ],
     }])
     odoo("account.move", "action_post", [[settle_id]])
