@@ -2098,6 +2098,41 @@ def dashboard():
     return Response(render_dashboard(rows, days), mimetype="text/html")
 
 
+@app.route("/admin/fulfillment-check", methods=["GET"])
+def admin_fulfillment_check():
+    """One-off tool: given a comma-separated list of Shopify order names,
+    reports each one's real fulfillment_status/financial_status straight
+    from Shopify. Built 2026-11-19 to figure out which of the orders
+    affected by the missing-delivery bug (skip_procurement blocked
+    delivery creation 11/9-11/19) actually physically shipped already vs.
+    are still sitting, since Odoo has no record either way for them."""
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    names = [n.strip() for n in (request.args.get("names") or "").split(",") if n.strip()]
+    if not names:
+        return jsonify({"error": "names query param is required, comma-separated"}), 400
+    try:
+        token = shopify_access_token()
+        results = []
+        for name in names:
+            order = fetch_shopify_order_by_name(token, name)
+            if not order:
+                results.append({"name": name, "error": "not found in Shopify"})
+                continue
+            results.append({
+                "name": name,
+                "financial_status": order.get("financial_status"),
+                "fulfillment_status": order.get("fulfillment_status"),
+                "fulfillments": [{"status": f.get("status"), "created_at": f.get("created_at"),
+                                   "tracking_number": f.get("tracking_number")} for f in order.get("fulfillments", [])],
+            })
+        return jsonify(results)
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+
+
 @app.route("/dashboard/products-data", methods=["GET"])
 def dashboard_products_data():
     if not check_dashboard_auth():
