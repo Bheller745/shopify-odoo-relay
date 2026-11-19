@@ -462,6 +462,23 @@ def create_backorder_mos(order_id, order_ref):
         if already:
             continue
 
+        # These products carry the native MTO route (for manually-created
+        # orders, so Odoo auto-links an MO on confirm). That means the
+        # action_confirm() call above may have ALSO just created its own
+        # native MO for this exact line -- auto-confirmed, no batching, no
+        # x_sale_order_id, not what the floor process expects. Cancel it
+        # before creating the real one below so there's only ever one MO
+        # per line, matching how Bennett already resolved this by hand for
+        # the first batch of duplicates on 2026-11-09.
+        native_dupes = odoo("mrp.production", "search",
+            [[("sale_line_id", "=", line["id"]), ("x_sale_order_id", "=", False),
+              ("state", "not in", ["cancel", "done"])]])
+        for dupe_id in native_dupes:
+            try:
+                odoo("mrp.production", "action_cancel", [[dupe_id]])
+            except Exception:
+                pass  # best-effort -- the real MO still gets created below
+
         for batch_qty in split_into_batches(qty_ordered):
             # Left in "draft" deliberately -- Bennett wants "Confirmed" (=
             # Awaiting Build) to mean the work order has actually been
@@ -790,14 +807,16 @@ def sync_order_from_payload(payload):
     financial_status = payload.get("financial_status")
     if financial_status in ("paid", "partially_paid") or payload.get("confirmed"):
         try:
-            # skip_procurement: these products now carry the native MTO
-            # route (added for manually-created orders so Odoo auto-links
-            # an MO on confirm). Without this flag, action_confirm would
-            # ALSO fire Odoo's own MTO procurement here, creating a second,
-            # wrongly-shaped MO (auto-confirmed, no batching, no
-            # x_sale_order_id) alongside the one create_backorder_mos()
-            # builds below -- real duplicate builds on the floor.
-            odoo("sale.order", "action_confirm", [[new_id]], {"context": {"skip_procurement": True}})
+            # NOTE: do NOT pass skip_procurement here -- found 2026-11-19
+            # that it doesn't just suppress the native-MTO manufacturing
+            # order, it suppresses ALL procurement-triggered stock rules,
+            # including the customer delivery itself. Every order confirmed
+            # with that flag (2026-11-09 through today) got zero delivery
+            # and never left stock. The MTO-duplicate problem it was meant
+            # to fix is instead handled below, reactively, by cancelling
+            # whichever native MO this produces once create_backorder_mos()
+            # is about to create the real one for the same line.
+            odoo("sale.order", "action_confirm", [[new_id]])
         except Exception:
             pass  # already confirmed or not confirmable yet -- not fatal
 
