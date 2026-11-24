@@ -1347,6 +1347,62 @@ def sync_inventory_to_shopify(sku_filter=None, dry_run=False, odoo_call=odoo, on
     return results
 
 
+def set_deny_inventory_policy(sku_filter=None, dry_run=False, odoo_call=odoo, on_progress=None):
+    """Sets inventory_policy to 'deny' ('Continue selling when out of
+    stock' OFF) on every tracked Shopify variant. Separate from the
+    inventory-level sync: that pushes a 0 or 1568 or whatever the real
+    available-to-sell number is, but with inventory_policy still
+    'continue' a 0 doesn't actually stop checkout. This only needs to run
+    once per variant (not on a schedule the way the quantity sync does) --
+    it's a standing setting, not something that needs recomputing."""
+    token = shopify_access_token()
+    shopify_products = fetch_all_shopify_products_slim(token)
+
+    variants = []
+    for p in shopify_products:
+        for v in p.get("variants", []):
+            sku = (v.get("sku") or "").strip()
+            if not sku or (sku_filter and sku not in sku_filter):
+                continue
+            if v.get("inventory_management") != "shopify":
+                continue  # not tracked -- policy is moot either way
+            if v.get("inventory_policy") == "deny":
+                continue  # already correct, nothing to push
+            variants.append({"id": v.get("id"), "sku": sku, "product_title": p.get("title")})
+
+    results = []
+    total = len(variants)
+    for done, v in enumerate(variants, start=1):
+        if on_progress:
+            on_progress(done, total)
+        row = {"sku": v["sku"], "product_title": v["product_title"]}
+        if dry_run:
+            row["dry_run"] = True
+            results.append(row)
+            continue
+        body = json.dumps({"variant": {"id": v["id"], "inventory_policy": "deny"}}).encode()
+        req = urllib.request.Request(
+            f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/variants/{v['id']}.json",
+            data=body, method="PUT",
+            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"})
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    json.loads(resp.read())
+                row["updated"] = True
+                break
+            except urllib.error.HTTPError as e:
+                body_text = e.read().decode()[:300]
+                if e.code == 429 and attempt == 0:
+                    time.sleep(2.0)
+                    continue
+                row["error"] = f"Shopify API error: {e.code} {body_text}"
+                break
+        time.sleep(0.55)
+        results.append(row)
+    return results
+
+
 def shopify_order_url(shopify_id):
     handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
     return f"https://admin.shopify.com/store/{handle}/orders/{shopify_id}"
@@ -2408,6 +2464,54 @@ def admin_inventory_sync_status():
     if not job:
         return jsonify({"error": "unknown job_id"}), 404
     return jsonify(job)
+
+
+def _run_deny_policy_job(job_id, sku_filter, dry_run):
+    job = _inventory_sync_jobs[job_id]
+    job["progress"] = {"done": 0, "total": 0}
+
+    def on_progress(done, total):
+        job["progress"] = {"done": done, "total": total}
+
+    try:
+        results = set_deny_inventory_policy(sku_filter, dry_run, odoo_call=odoo_bg, on_progress=on_progress)
+        job["status"] = "done"
+        job["results"] = results
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)[:1000]
+    job["finished_at"] = time.time()
+
+
+@app.route("/admin/inventory-sync/deny-policy", methods=["GET"])
+def admin_deny_policy():
+    """One-time setting, not a recurring sync: turns OFF 'Continue selling
+    when out of stock' (sets inventory_policy='deny') on every tracked
+    Shopify variant that doesn't already have it set. Without this, the
+    quantity sync can correctly push 0 and Shopify will still let people
+    check out anyway. Same ?skus=/&dry_run=1/job-polling pattern as
+    /admin/inventory-sync."""
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    sku_filter = None
+    if request.args.get("skus"):
+        sku_filter = {s.strip() for s in request.args["skus"].split(",") if s.strip()}
+    dry_run = request.args.get("dry_run") == "1"
+
+    if sku_filter is not None:
+        try:
+            results = set_deny_inventory_policy(sku_filter, dry_run)
+            return jsonify({"dry_run": dry_run, "count": len(results), "results": results})
+        except urllib.error.HTTPError as e:
+            return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+
+    job_id = str(uuid.uuid4())
+    _inventory_sync_jobs[job_id] = {"status": "running", "started_at": time.time(), "dry_run": dry_run}
+    threading.Thread(target=_run_deny_policy_job, args=(job_id, None, dry_run), daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "running",
+                     "poll": f"/admin/inventory-sync/status?job_id={job_id}"})
 
 
 @app.route("/dashboard/products-data", methods=["GET"])
