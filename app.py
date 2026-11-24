@@ -1129,6 +1129,153 @@ def audit_products():
     return rows
 
 
+_SHOPIFY_LOCATION_ID = None
+
+
+def shopify_location_id(token):
+    """Inventory levels are set per-location in Shopify. 920D only has the
+    one real warehouse/location on the Shopify side, so just use whichever
+    comes back first -- cached per-process since it never changes."""
+    global _SHOPIFY_LOCATION_ID
+    if _SHOPIFY_LOCATION_ID is None:
+        req = urllib.request.Request(f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/locations.json",
+                                      headers={"X-Shopify-Access-Token": token})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            locations = json.loads(resp.read())["locations"]
+        _SHOPIFY_LOCATION_ID = locations[0]["id"]
+    return _SHOPIFY_LOCATION_ID
+
+
+def compute_available_to_sell(template_ids):
+    """For each product template: on-hand (qty_available) plus, for
+    anything with a BOM, how many MORE could be built right now from
+    current component stock (the most-constrained component sets the
+    cap). This is deliberately "buildable", not just "on hand" -- most of
+    this catalog is built-to-order, so 0 pre-built units doesn't mean 0
+    sellable.
+
+    One level deep only: a BOM component that's itself build-to-order
+    with 0 on hand gets treated as 0 available even if IT could also be
+    built from ITS OWN components (e.g. a harness sub-assembly). That
+    under-counts the parent's real buildable quantity rather than
+    over-counting it -- the safe direction for an error to be in, since
+    this feeds "should Shopify still let people buy this.\""""
+    templates = odoo("product.template", "read", [template_ids], {"fields": ["qty_available", "bom_ids"]})
+    tmpl_by_id = {t["id"]: t for t in templates}
+
+    bom_ids = [bid for t in templates for bid in t["bom_ids"]]
+    boms = odoo("mrp.bom", "read", [bom_ids], {"fields": ["product_tmpl_id", "bom_line_ids"]}) if bom_ids else []
+    bom_by_tmpl = {b["product_tmpl_id"][0]: b for b in boms}  # one active BOM per template, same assumption the MRP rollout used all session
+
+    all_line_ids = [lid for b in boms for lid in b["bom_line_ids"]]
+    lines = odoo("mrp.bom.line", "read", [all_line_ids], {"fields": ["product_id", "product_qty"]}) if all_line_ids else []
+    lines_by_bom = {}
+    for b in boms:
+        lines_by_bom[b["id"]] = [l for l in lines if l["id"] in b["bom_line_ids"]]
+
+    component_variant_ids = list({l["product_id"][0] for l in lines})
+    component_qty = {}
+    if component_variant_ids:
+        comps = odoo("product.product", "read", [component_variant_ids], {"fields": ["qty_available"]})
+        component_qty = {c["id"]: c["qty_available"] for c in comps}
+
+    result = {}
+    for tmpl_id in template_ids:
+        t = tmpl_by_id.get(tmpl_id)
+        if not t:
+            continue
+        on_hand = t["qty_available"]
+        bom = bom_by_tmpl.get(tmpl_id)
+        if not bom:
+            result[tmpl_id] = on_hand
+            continue
+        bom_lines = lines_by_bom.get(bom["id"], [])
+        if not bom_lines:
+            result[tmpl_id] = on_hand
+            continue
+        buildable = min(
+            (component_qty.get(l["product_id"][0], 0) / l["product_qty"]) if l["product_qty"] else 0
+            for l in bom_lines
+        )
+        result[tmpl_id] = on_hand + int(buildable)
+    return result
+
+
+def sync_inventory_to_shopify(sku_filter=None, dry_run=False):
+    """Computes available-to-sell for every real (non-service) Shopify
+    SKU and pushes it to Shopify's inventory level for that SKU's variant.
+    sku_filter, if given, restricts both the Shopify fetch and the push to
+    just those SKUs -- used for the initial supervised test batch before
+    this runs unattended against the whole catalog."""
+    token = shopify_access_token()
+    shopify_products = fetch_all_shopify_products(token)
+
+    variants_by_sku = {}
+    for p in shopify_products:
+        for v in p.get("variants", []):
+            sku = (v.get("sku") or "").strip()
+            if not sku or (sku_filter and sku not in sku_filter):
+                continue
+            variants_by_sku[sku] = {
+                "inventory_item_id": v.get("inventory_item_id"),
+                "inventory_management": v.get("inventory_management"),
+                "inventory_policy": v.get("inventory_policy"),
+                "product_title": p.get("title"),
+            }
+
+    if not variants_by_sku:
+        return []
+
+    odoo_templates = odoo("product.template", "search_read",
+        [[("default_code", "in", list(variants_by_sku.keys()))]], {"fields": ["id", "default_code"]})
+    tmpl_id_by_sku = {t["default_code"]: t["id"] for t in odoo_templates}
+
+    available = compute_available_to_sell(list(tmpl_id_by_sku.values()))
+    location_id = shopify_location_id(token)
+
+    results = []
+    for sku, variant in variants_by_sku.items():
+        tmpl_id = tmpl_id_by_sku.get(sku)
+        if tmpl_id is None:
+            results.append({"sku": sku, "error": "no matching Odoo product by SKU"})
+            continue
+        qty = available.get(tmpl_id)
+        if qty is None:
+            results.append({"sku": sku, "error": "could not compute availability"})
+            continue
+        row = {
+            "sku": sku, "product_title": variant["product_title"], "available_to_sell": qty,
+            "inventory_management": variant["inventory_management"],
+            "inventory_policy": variant["inventory_policy"],
+            "tracked": variant["inventory_management"] == "shopify",
+        }
+        if not row["tracked"]:
+            row["skipped"] = "inventory tracking is off for this variant in Shopify -- turn on 'Track quantity' before this can control its availability"
+            results.append(row)
+            continue
+        if dry_run:
+            row["dry_run"] = True
+            results.append(row)
+            continue
+        body = json.dumps({
+            "location_id": location_id,
+            "inventory_item_id": variant["inventory_item_id"],
+            "available": qty,
+        }).encode()
+        req = urllib.request.Request(
+            f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json",
+            data=body, method="POST",
+            headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                json.loads(resp.read())
+            row["pushed"] = True
+        except urllib.error.HTTPError as e:
+            row["error"] = f"Shopify API error: {e.code} {e.read().decode()[:300]}"
+        results.append(row)
+    return results
+
+
 def shopify_order_url(shopify_id):
     handle = (SHOPIFY_STORE_DOMAIN or "").replace(".myshopify.com", "")
     return f"https://admin.shopify.com/store/{handle}/orders/{shopify_id}"
@@ -2129,6 +2276,27 @@ def admin_fulfillment_check():
                                    "tracking_number": f.get("tracking_number")} for f in order.get("fulfillments", [])],
             })
         return jsonify(results)
+    except urllib.error.HTTPError as e:
+        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+
+
+@app.route("/admin/inventory-sync", methods=["GET"])
+def admin_inventory_sync():
+    """Push Odoo's computed available-to-sell quantity to Shopify.
+    ?skus=A,B,C restricts to just those SKUs (the supervised test batch);
+    omit to run the full catalog. &dry_run=1 computes and reports without
+    actually pushing to Shopify -- use this first on any new SKU set."""
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
+        return jsonify({"error": "Shopify API credentials not configured on this server"}), 500
+    sku_filter = None
+    if request.args.get("skus"):
+        sku_filter = {s.strip() for s in request.args["skus"].split(",") if s.strip()}
+    dry_run = request.args.get("dry_run") == "1"
+    try:
+        results = sync_inventory_to_shopify(sku_filter, dry_run)
+        return jsonify({"dry_run": dry_run, "count": len(results), "results": results})
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
 
