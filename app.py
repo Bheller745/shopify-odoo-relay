@@ -1175,9 +1175,11 @@ def compute_available_to_sell(template_ids):
 
     component_variant_ids = list({l["product_id"][0] for l in lines})
     component_qty = {}
+    component_storable = set()
     if component_variant_ids:
-        comps = odoo("product.product", "read", [component_variant_ids], {"fields": ["qty_available"]})
+        comps = odoo("product.product", "read", [component_variant_ids], {"fields": ["qty_available", "is_storable"]})
         component_qty = {c["id"]: c["qty_available"] for c in comps}
+        component_storable = {c["id"] for c in comps if c["is_storable"]}
 
     result = {}
     for tmpl_id in template_ids:
@@ -1189,7 +1191,14 @@ def compute_available_to_sell(template_ids):
         if not bom:
             result[tmpl_id] = on_hand
             continue
-        bom_lines = lines_by_bom.get(bom["id"], [])
+        # Non-storable BOM lines (labor/"Assembly" placeholders, small
+        # consumables like screws/templates never set up as stock-tracked)
+        # have a meaningless qty_available of 0 -- counting them as a real
+        # stock constraint wrongly caps buildable at 0 even when every
+        # actual stocked component is plentiful. Found 2026-11-24 on
+        # SWPG-HSS-B-S7W-HSS-MT: real components all had hundreds+ on hand,
+        # but the untracked "Assembly" line alone drove buildable to 0.
+        bom_lines = [l for l in lines_by_bom.get(bom["id"], []) if l["product_id"][0] in component_storable]
         if not bom_lines:
             result[tmpl_id] = on_hand
             continue
