@@ -28,10 +28,12 @@ import hmac
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import xmlrpc.client
 from datetime import datetime, timedelta, timezone
 
@@ -70,6 +72,21 @@ def odoo_safe(model, method, args, kwargs=None):
         if "cannot marshal None" in str(e):
             return None
         raise
+
+
+# A full-catalog inventory sync can run for minutes -- way past any
+# request timeout. It runs in a background thread with its OWN xmlrpc
+# connection (xmlrpc.client.ServerProxy isn't safe to share across
+# threads) so it can't corrupt the main request-handling thread's Odoo
+# calls -- webhooks still need to work normally while a sync is running.
+_bg_models = xmlrpc.client.ServerProxy(f"{ODOO_URL}/xmlrpc/2/object", allow_none=True)
+
+
+def odoo_bg(model, method, args, kwargs=None):
+    return _bg_models.execute_kw(ODOO_DB, _uid, ODOO_PASSWORD, model, method, args, kwargs or {})
+
+
+_inventory_sync_jobs = {}  # job_id -> {"status", "started_at", "finished_at", "results"/"error"}
 
 
 def verify_hmac(raw_body: bytes, hmac_header: str) -> bool:
@@ -1169,7 +1186,7 @@ def shopify_location_id(token):
     return _SHOPIFY_LOCATION_ID
 
 
-def compute_available_to_sell(template_ids):
+def compute_available_to_sell(template_ids, odoo_call=odoo):
     """For each product template: on-hand (qty_available) plus, for
     anything with a BOM, how many MORE could be built right now from
     current component stock (the most-constrained component sets the
@@ -1183,15 +1200,15 @@ def compute_available_to_sell(template_ids):
     under-counts the parent's real buildable quantity rather than
     over-counting it -- the safe direction for an error to be in, since
     this feeds "should Shopify still let people buy this.\""""
-    templates = odoo("product.template", "read", [template_ids], {"fields": ["qty_available", "bom_ids"]})
+    templates = odoo_call("product.template", "read", [template_ids], {"fields": ["qty_available", "bom_ids"]})
     tmpl_by_id = {t["id"]: t for t in templates}
 
     bom_ids = [bid for t in templates for bid in t["bom_ids"]]
-    boms = odoo("mrp.bom", "read", [bom_ids], {"fields": ["product_tmpl_id", "bom_line_ids"]}) if bom_ids else []
+    boms = odoo_call("mrp.bom", "read", [bom_ids], {"fields": ["product_tmpl_id", "bom_line_ids"]}) if bom_ids else []
     bom_by_tmpl = {b["product_tmpl_id"][0]: b for b in boms}  # one active BOM per template, same assumption the MRP rollout used all session
 
     all_line_ids = [lid for b in boms for lid in b["bom_line_ids"]]
-    lines = odoo("mrp.bom.line", "read", [all_line_ids], {"fields": ["product_id", "product_qty"]}) if all_line_ids else []
+    lines = odoo_call("mrp.bom.line", "read", [all_line_ids], {"fields": ["product_id", "product_qty"]}) if all_line_ids else []
     lines_by_bom = {}
     for b in boms:
         lines_by_bom[b["id"]] = [l for l in lines if l["id"] in b["bom_line_ids"]]
@@ -1200,7 +1217,7 @@ def compute_available_to_sell(template_ids):
     component_qty = {}
     component_storable = set()
     if component_variant_ids:
-        comps = odoo("product.product", "read", [component_variant_ids], {"fields": ["qty_available", "is_storable"]})
+        comps = odoo_call("product.product", "read", [component_variant_ids], {"fields": ["qty_available", "is_storable"]})
         component_qty = {c["id"]: c["qty_available"] for c in comps}
         component_storable = {c["id"] for c in comps if c["is_storable"]}
 
@@ -1233,12 +1250,15 @@ def compute_available_to_sell(template_ids):
     return result
 
 
-def sync_inventory_to_shopify(sku_filter=None, dry_run=False):
+def sync_inventory_to_shopify(sku_filter=None, dry_run=False, odoo_call=odoo, on_progress=None):
     """Computes available-to-sell for every real (non-service) Shopify
     SKU and pushes it to Shopify's inventory level for that SKU's variant.
     sku_filter, if given, restricts both the Shopify fetch and the push to
     just those SKUs -- used for the initial supervised test batch before
-    this runs unattended against the whole catalog."""
+    this runs unattended against the whole catalog. on_progress(done,
+    total), if given, is called after each push -- the full catalog takes
+    long enough that /admin/inventory-sync/status needs something to show
+    besides "still running"."""
     token = shopify_access_token()
     shopify_products = fetch_all_shopify_products_slim(token)
 
@@ -1258,15 +1278,18 @@ def sync_inventory_to_shopify(sku_filter=None, dry_run=False):
     if not variants_by_sku:
         return []
 
-    odoo_templates = odoo("product.template", "search_read",
+    odoo_templates = odoo_call("product.template", "search_read",
         [[("default_code", "in", list(variants_by_sku.keys()))]], {"fields": ["id", "default_code"]})
     tmpl_id_by_sku = {t["default_code"]: t["id"] for t in odoo_templates}
 
-    available = compute_available_to_sell(list(tmpl_id_by_sku.values()))
+    available = compute_available_to_sell(list(tmpl_id_by_sku.values()), odoo_call=odoo_call)
     location_id = shopify_location_id(token)
 
     results = []
-    for sku, variant in variants_by_sku.items():
+    total = len(variants_by_sku)
+    for done, (sku, variant) in enumerate(variants_by_sku.items(), start=1):
+        if on_progress:
+            on_progress(done, total)
         tmpl_id = tmpl_id_by_sku.get(sku)
         if tmpl_id is None:
             results.append({"sku": sku, "error": "no matching Odoo product by SKU"})
@@ -2312,12 +2335,31 @@ def admin_fulfillment_check():
         return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
 
 
+def _run_inventory_sync_job(job_id, sku_filter, dry_run):
+    job = _inventory_sync_jobs[job_id]
+    job["progress"] = {"done": 0, "total": 0}
+
+    def on_progress(done, total):
+        job["progress"] = {"done": done, "total": total}
+
+    try:
+        results = sync_inventory_to_shopify(sku_filter, dry_run, odoo_call=odoo_bg, on_progress=on_progress)
+        job["status"] = "done"
+        job["results"] = results
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)[:1000]
+    job["finished_at"] = time.time()
+
+
 @app.route("/admin/inventory-sync", methods=["GET"])
 def admin_inventory_sync():
     """Push Odoo's computed available-to-sell quantity to Shopify.
-    ?skus=A,B,C restricts to just those SKUs (the supervised test batch);
-    omit to run the full catalog. &dry_run=1 computes and reports without
-    actually pushing to Shopify -- use this first on any new SKU set."""
+    ?skus=A,B,C restricts to just those SKUs (the supervised test batch,
+    runs synchronously and returns the result directly); omit to run the
+    full catalog, which takes minutes -- runs as a background job instead,
+    returning a job_id to poll via /admin/inventory-sync/status. &dry_run=1
+    computes and reports without actually pushing to Shopify."""
     if not check_dashboard_auth():
         return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
     if not (SHOPIFY_STORE_DOMAIN and SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET):
@@ -2326,11 +2368,30 @@ def admin_inventory_sync():
     if request.args.get("skus"):
         sku_filter = {s.strip() for s in request.args["skus"].split(",") if s.strip()}
     dry_run = request.args.get("dry_run") == "1"
-    try:
-        results = sync_inventory_to_shopify(sku_filter, dry_run)
-        return jsonify({"dry_run": dry_run, "count": len(results), "results": results})
-    except urllib.error.HTTPError as e:
-        return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+
+    if sku_filter is not None:
+        try:
+            results = sync_inventory_to_shopify(sku_filter, dry_run)
+            return jsonify({"dry_run": dry_run, "count": len(results), "results": results})
+        except urllib.error.HTTPError as e:
+            return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
+
+    job_id = str(uuid.uuid4())
+    _inventory_sync_jobs[job_id] = {"status": "running", "started_at": time.time(), "dry_run": dry_run}
+    threading.Thread(target=_run_inventory_sync_job, args=(job_id, None, dry_run), daemon=True).start()
+    return jsonify({"job_id": job_id, "status": "running",
+                     "poll": f"/admin/inventory-sync/status?job_id={job_id}"})
+
+
+@app.route("/admin/inventory-sync/status", methods=["GET"])
+def admin_inventory_sync_status():
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    job_id = request.args.get("job_id")
+    job = _inventory_sync_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "unknown job_id"}), 404
+    return jsonify(job)
 
 
 @app.route("/dashboard/products-data", methods=["GET"])
