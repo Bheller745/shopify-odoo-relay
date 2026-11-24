@@ -1046,6 +1046,29 @@ def fetch_all_shopify_products(token):
     return products
 
 
+def fetch_all_shopify_products_slim(token):
+    """Same pagination as fetch_all_shopify_products, but asks Shopify for
+    only id/title/variants -- the full-catalog version includes body_html,
+    images, etc. for every one of 2000+ products, which is what pushed the
+    first full-catalog inventory-sync attempt over Render's timeout.
+    Variants still come back with sku/inventory_item_id/inventory_management/
+    inventory_policy, everything compute_available_to_sell's caller needs."""
+    url = (f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/products.json"
+           f"?limit=250&fields=id,title,variants")
+    products = []
+    while url:
+        req = urllib.request.Request(url, headers={"X-Shopify-Access-Token": token})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            link_header = resp.headers.get("Link", "") or ""
+            data = json.loads(resp.read())
+        products.extend(data.get("products", []))
+        url = None
+        for part in link_header.split(","):
+            if 'rel="next"' in part:
+                url = part.split(";")[0].strip().strip("<> ")
+    return products
+
+
 def fetch_shopify_order_by_name(token, name):
     """Looks up one real order's full payload by its Shopify name (e.g.
     "920-36449") -- used by the dashboard's "Fix" action, which only knows
@@ -1217,7 +1240,7 @@ def sync_inventory_to_shopify(sku_filter=None, dry_run=False):
     just those SKUs -- used for the initial supervised test batch before
     this runs unattended against the whole catalog."""
     token = shopify_access_token()
-    shopify_products = fetch_all_shopify_products(token)
+    shopify_products = fetch_all_shopify_products_slim(token)
 
     variants_by_sku = {}
     for p in shopify_products:
