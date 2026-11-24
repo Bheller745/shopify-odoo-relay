@@ -88,6 +88,19 @@ def odoo_bg(model, method, args, kwargs=None):
 
 _inventory_sync_jobs = {}  # job_id -> {"status", "started_at", "finished_at", "results"/"error"}
 
+# Latest full-catalog quantity-sync result, kept around so the visualizer
+# always has something to show without needing a specific job_id -- a
+# visitor to the page has no way to know which job_id was the last
+# full-catalog one otherwise. Only ever written from a FULL run (no sku
+# filter); a small manual test batch would otherwise wipe out the real
+# picture with just 1-2 products.
+_latest_inventory_snapshot = {"updated_at": None, "results": []}
+
+
+def _record_inventory_snapshot(results):
+    _latest_inventory_snapshot["updated_at"] = time.time()
+    _latest_inventory_snapshot["results"] = results
+
 
 def verify_hmac(raw_body: bytes, hmac_header: str) -> bool:
     digest = hmac.new(SHOPIFY_WEBHOOK_SECRET.encode("utf-8"), raw_body, hashlib.sha256).digest()
@@ -1792,6 +1805,76 @@ def render_products_section(rows):
 </s-stack>"""
 
 
+def render_inventory_section(snapshot):
+    results = snapshot["results"]
+    updated_at = snapshot["updated_at"]
+    age = f"{int((time.time() - updated_at) / 60)} min ago" if updated_at else "never run yet"
+
+    out_of_stock = sum(1 for r in results if r.get("available_to_sell") == 0)
+    in_stock = sum(1 for r in results if r.get("available_to_sell", 0) > 0)
+    errored = sum(1 for r in results if "error" in r)
+
+    def sort_key(r):
+        # Out-of-stock first (the actionable part), then lowest-stock-first
+        # within "in stock", errors/unknowns at the very bottom.
+        qty = r.get("available_to_sell")
+        if qty is None:
+            return (2, 0, r.get("sku", ""))
+        return (0 if qty == 0 else 1, qty, r.get("sku", ""))
+
+    body_rows = []
+    for r in sorted(results, key=sort_key):
+        sku = r.get("sku", "")
+        title = r.get("product_title") or sku
+        qty = r.get("available_to_sell")
+        if "error" in r:
+            status, tone, bar_color, qty_cell = "error", "critical", "#d72c0d", "-"
+            badge_html = '<s-badge tone="critical">Error</s-badge>'
+        elif "skipped" in r:
+            status, tone, bar_color = "untracked", "neutral", "#8a8a8a"
+            qty_cell = "-"
+            badge_html = '<s-badge tone="neutral">Not tracked</s-badge>'
+        elif qty == 0:
+            status, bar_color = "out", "#d72c0d"
+            qty_cell = "0"
+            badge_html = '<s-badge tone="critical">Out of stock</s-badge>'
+        else:
+            status, bar_color = "in", "#008060"
+            qty_cell = str(int(qty))
+            badge_html = '<s-badge tone="success">In stock</s-badge>'
+        body_rows.append(
+            f'<s-table-row data-status="{status}" data-search="{(sku + " " + title).lower()}">'
+            f'<s-table-cell><div class="order-cell" style="border-left-color:{bar_color}">'
+            f'<b class="nowrap">{sku}</b></div></s-table-cell>'
+            f'<s-table-cell>{title}</s-table-cell>'
+            f'<s-table-cell>{badge_html}</s-table-cell>'
+            f'<s-table-cell class="nowrap">{qty_cell}</s-table-cell>'
+            f'</s-table-row>'
+        )
+    return f"""<s-stack gap="base">
+<div style="display:flex; gap:12px; width:100%;">
+<s-section heading="Last synced" style="flex:1"><s-paragraph>{age}</s-paragraph></s-section>
+<s-section heading="In stock" style="flex:1"><s-paragraph>{in_stock}</s-paragraph></s-section>
+<s-section heading="Out of stock" style="flex:1"><s-paragraph>{out_of_stock}</s-paragraph></s-section>
+<s-section heading="Errors" style="flex:1"><s-paragraph>{errored}</s-paragraph></s-section>
+</div>
+<div class="filter-toolbar">
+  <input type="text" id="i-search" placeholder="Search SKU or product title...">
+  <select id="i-status"><option value="">All products</option><option value="out">Out of stock</option><option value="in">In stock</option><option value="error">Error</option><option value="untracked">Not tracked</option></select>
+</div>
+<div class="table-scroll">
+<s-table>
+<s-table-header-row>
+<s-table-header>SKU</s-table-header><s-table-header>Product</s-table-header><s-table-header>Status</s-table-header><s-table-header>Available</s-table-header>
+</s-table-header-row>
+<s-table-body id="inventory-table-body">
+{''.join(body_rows) if body_rows else '<s-table-row><s-table-cell colspan="4">No sync has run yet -- check back in a few minutes.</s-table-cell></s-table-row>'}
+</s-table-body>
+</s-table>
+</div>
+</s-stack>"""
+
+
 FILTER_JS = """
 function wireFilters() {
   const search = document.getElementById('f-search');
@@ -2043,6 +2126,22 @@ function wireProductFilters() {
   wireProductFixButtons();
 }
 
+function wireInventoryFilters() {
+  const search = document.getElementById('i-search');
+  const status = document.getElementById('i-status');
+  if (!search) return;
+  function apply() {
+    const q = search.value.toLowerCase();
+    const rows = document.querySelectorAll('#inventory-table-body s-table-row');
+    rows.forEach(function(row) {
+      const matchesSearch = !q || row.dataset.search.includes(q);
+      const matchesFilter = !status.value || row.dataset.status === status.value;
+      row.style.display = (matchesSearch && matchesFilter) ? '' : 'none';
+    });
+  }
+  [search, status].forEach(function(el) { el.addEventListener('input', apply); });
+}
+
 function showProductActionError(sku, message) {
   console.error('Fix failed for', sku, message);
   const container = document.querySelector('.action-cell[data-sku="' + sku + '"]');
@@ -2132,11 +2231,13 @@ def render_dashboard(rows, days):
 <div class="tabs">
   <button class="tab-btn active" id="tab-orders-btn">Orders</button>
   <button class="tab-btn" id="tab-products-btn">Products</button>
+  <button class="tab-btn" id="tab-inventory-btn">Inventory</button>
 </div>
 <div id="orders-content">
 {render_table_section(rows, days)}
 </div>
 <div id="products-content" style="display:none">Loading...</div>
+<div id="inventory-content" style="display:none">Loading...</div>
 </div>
 <script>{FILTER_JS}
 const ODOO_BASE_URL = {json.dumps(ODOO_URL)};
@@ -2167,15 +2268,32 @@ async function loadProducts() {{
   wireProductFilters();
   productsLoaded = true;
 }}
+let inventoryLoaded = false;
+async function loadInventory() {{
+  const el = document.getElementById('inventory-content');
+  el.innerHTML = 'Loading...';
+  const resp = await fetch('/dashboard/inventory-data', {{ headers: await getAuthHeaders() }});
+  if (!resp.ok) {{
+    el.innerHTML = '<s-banner tone="critical"><s-paragraph>Failed to load (' + resp.status + '): ' + await resp.text() + '</s-paragraph></s-banner>';
+    return;
+  }}
+  el.innerHTML = await resp.text();
+  wireInventoryFilters();
+  inventoryLoaded = true;
+}}
 function switchTab(tab) {{
   document.getElementById('orders-content').style.display = (tab === 'orders') ? '' : 'none';
   document.getElementById('products-content').style.display = (tab === 'products') ? '' : 'none';
+  document.getElementById('inventory-content').style.display = (tab === 'inventory') ? '' : 'none';
   document.getElementById('tab-orders-btn').classList.toggle('active', tab === 'orders');
   document.getElementById('tab-products-btn').classList.toggle('active', tab === 'products');
+  document.getElementById('tab-inventory-btn').classList.toggle('active', tab === 'inventory');
   if (tab === 'products' && !productsLoaded) loadProducts();
+  if (tab === 'inventory' && !inventoryLoaded) loadInventory();
 }}
 document.getElementById('tab-orders-btn').addEventListener('click', function() {{ switchTab('orders'); }});
 document.getElementById('tab-products-btn').addEventListener('click', function() {{ switchTab('products'); }});
+document.getElementById('tab-inventory-btn').addEventListener('click', function() {{ switchTab('inventory'); }});
 wireAll(getAuthHeaders, loadOrders);
 </script>
 </body></html>"""
@@ -2418,6 +2536,8 @@ def _run_inventory_sync_job(job_id, sku_filter, dry_run):
         results = sync_inventory_to_shopify(sku_filter, dry_run, odoo_call=odoo_bg, on_progress=on_progress)
         job["status"] = "done"
         job["results"] = results
+        if sku_filter is None and not dry_run:
+            _record_inventory_snapshot(results)
     except Exception as e:
         job["status"] = "error"
         job["error"] = str(e)[:1000]
@@ -2525,6 +2645,18 @@ def dashboard_products_data():
     except urllib.error.HTTPError as e:
         return jsonify({"error": f"Shopify API error: {e.code} {e.read().decode()[:500]}"}), 502
     return Response(render_products_section(rows), mimetype="text/html")
+
+
+@app.route("/dashboard/inventory-data", methods=["GET"])
+def dashboard_inventory_data():
+    """Renders whatever the most recent full-catalog sync produced --
+    either the automatic 15-minute run or a manually-triggered full run,
+    whichever happened last. Doesn't trigger a new sync itself (that would
+    make loading this tab slow and would duplicate the rate-limited push
+    the scheduler already does)."""
+    if not check_dashboard_auth():
+        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
+    return Response(render_inventory_section(_latest_inventory_snapshot), mimetype="text/html")
 
 
 def _b64url_decode(s):
@@ -2713,6 +2845,7 @@ def _inventory_sync_scheduler_loop():
             errors = sum(1 for r in results if "error" in r)
             _scheduled_sync_state["last_status"] = "done"
             _scheduled_sync_state["last_summary"] = {"total": len(results), "pushed": pushed, "errors": errors}
+            _record_inventory_snapshot(results)
         except Exception as e:
             _scheduled_sync_state["last_status"] = "error"
             _scheduled_sync_state["last_summary"] = str(e)[:500]
