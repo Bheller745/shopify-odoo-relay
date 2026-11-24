@@ -1315,18 +1315,34 @@ def sync_inventory_to_shopify(sku_filter=None, dry_run=False, odoo_call=odoo, on
         body = json.dumps({
             "location_id": location_id,
             "inventory_item_id": variant["inventory_item_id"],
-            "available": qty,
+            # Shopify rejects a JSON float here ("expected Float to be a
+            # Integer" -- its own wording) -- found on the very first real
+            # push, which otherwise failed 100% of the time on this alone.
+            "available": int(qty),
         }).encode()
         req = urllib.request.Request(
             f"https://{SHOPIFY_STORE_DOMAIN}/admin/api/{SHOPIFY_API_VERSION}/inventory_levels/set.json",
             data=body, method="POST",
             headers={"X-Shopify-Access-Token": token, "Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                json.loads(resp.read())
-            row["pushed"] = True
-        except urllib.error.HTTPError as e:
-            row["error"] = f"Shopify API error: {e.code} {e.read().decode()[:300]}"
+        # Shopify's REST API allows ~2 calls/second; firing this loop with
+        # no throttle hit "Exceeded 2 calls per second" on nearly every
+        # request in the first full-catalog run. One retry-after-backoff
+        # on an actual 429, plus a baseline pause every call, keeps this
+        # under the limit without needing a token-bucket library.
+        for attempt in range(2):
+            try:
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    json.loads(resp.read())
+                row["pushed"] = True
+                break
+            except urllib.error.HTTPError as e:
+                body_text = e.read().decode()[:300]
+                if e.code == 429 and attempt == 0:
+                    time.sleep(2.0)
+                    continue
+                row["error"] = f"Shopify API error: {e.code} {body_text}"
+                break
+        time.sleep(0.55)
         results.append(row)
     return results
 
