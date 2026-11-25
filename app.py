@@ -1470,7 +1470,7 @@ def audit_sync(days):
     # the real financial record for them), so "not invoiced" on its own
     # isn't a sync problem worth flagging.
     odoo_orders = odoo("sale.order", "search_read", [[("name", "in", names)]], {"fields": [
-        "id", "name", "state", "locked",
+        "id", "name", "state", "locked", "delivery_status",
         "x_refunded_amount", "x_delivery_review_needed", "x_has_open_return",
         "x_dashboard_dismissed_hash",
     ]}) if names else []
@@ -1500,7 +1500,17 @@ def audit_sync(days):
                 issues.append(f"Shopify is {fin} but Odoo order is still draft")
             if fin == "paid" and fulfillment == "fulfilled" and not oo["locked"]:
                 issues.append("Fulfilled in Shopify but not marked shipped in Odoo")
-            if oo["x_delivery_review_needed"]:
+            # x_delivery_review_needed is only ever CLEARED by the
+            # dashboard's own "Fix" button (try_ship_delivery sets it when
+            # stock is short, nothing automatically re-checks after that).
+            # If the delivery got validated through some other path --
+            # someone fixing it directly in Odoo, a manual stock
+            # correction -- the flag just sits there forever even though
+            # the real problem is gone. Found 2026-11-24 on 3 orders where
+            # delivery_status was already "full" but the flag never
+            # cleared. Treat the flag as a hint, not a fact: only actually
+            # report it if the delivery still isn't really complete.
+            if oo["x_delivery_review_needed"] and oo["delivery_status"] != "full":
                 issues.append("Flagged in Odoo for delivery review")
             shopify_refunded = total_refunded(so)
             odoo_refunded = oo["x_refunded_amount"] or 0.0
