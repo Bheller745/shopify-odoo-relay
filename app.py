@@ -2821,48 +2821,19 @@ def healthz():
     return jsonify({"status": "ok"}), 200
 
 
-INVENTORY_SYNC_INTERVAL_SECONDS = 15 * 60
-
-_scheduled_sync_state = {"last_started": None, "last_finished": None, "last_status": None, "last_summary": None}
-
-
-@app.route("/admin/inventory-sync/schedule-status", methods=["GET"])
-def admin_inventory_sync_schedule_status():
-    """Read-only view of the automatic 15-minute inventory sync -- when it
-    last ran and what happened, independent of any manually-triggered job
-    via /admin/inventory-sync."""
-    if not check_dashboard_auth():
-        return Response("Authentication required", 401, {"WWW-Authenticate": 'Basic realm="920D Sync Dashboard"'})
-    return jsonify({**_scheduled_sync_state, "interval_seconds": INVENTORY_SYNC_INTERVAL_SECONDS})
-
-
-def _inventory_sync_scheduler_loop():
-    """Runs the full-catalog quantity sync (not the one-time deny-policy
-    setting) automatically every 15 minutes, for as long as this process
-    lives. Its own dedicated Odoo connection and a wait-then-run order
-    (not run-then-wait) so a deploy/restart doesn't immediately trigger a
-    heavy sync before the process has even finished starting up. Only
-    safe to run as a single long-lived background thread because this
-    service runs on exactly one gunicorn worker (no --workers flag in the
-    Procfile) -- multiple workers would each start their own copy of this
-    loop and race each other pushing the same inventory numbers."""
-    while True:
-        time.sleep(INVENTORY_SYNC_INTERVAL_SECONDS)
-        _scheduled_sync_state["last_started"] = time.time()
-        try:
-            results = sync_inventory_to_shopify(None, False, odoo_call=odoo_bg)
-            pushed = sum(1 for r in results if r.get("pushed"))
-            errors = sum(1 for r in results if "error" in r)
-            _scheduled_sync_state["last_status"] = "done"
-            _scheduled_sync_state["last_summary"] = {"total": len(results), "pushed": pushed, "errors": errors}
-            _record_inventory_snapshot(results)
-        except Exception as e:
-            _scheduled_sync_state["last_status"] = "error"
-            _scheduled_sync_state["last_summary"] = str(e)[:500]
-        _scheduled_sync_state["last_finished"] = time.time()
-
-
-threading.Thread(target=_inventory_sync_scheduler_loop, daemon=True).start()
+# NOTE: the automatic 15-minute sync does NOT run as an in-process
+# background thread -- this service is on Render's free tier, which sleeps
+# the whole process after a period of no incoming requests. A thread
+# sleeping for 15 minutes never survives long enough to fire; it just
+# restarts from zero every time Render spins the dyno back down and up.
+# Confirmed on 2026-11-24: schedule-status sat at "never run" indefinitely.
+# The actual schedule lives OUTSIDE this process instead: a GitHub Actions
+# cron workflow in this repo (.github/workflows/inventory-sync.yml) pings
+# /admin/inventory-sync every 15 minutes over HTTP, which has the added
+# benefit of keeping the service awake. That request runs through the
+# exact same code path as a manual sync (_run_inventory_sync_job), so it
+# populates the dashboard's Inventory tab the same way either one does --
+# no separate scheduler state to track here.
 
 
 if __name__ == "__main__":
